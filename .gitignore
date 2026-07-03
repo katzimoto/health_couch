@@ -1,0 +1,36 @@
+# Environment / secrets
+.env
+*.env
+!.env.example
+
+# Data & auth tokens (never commit)
+data/
+garmin-tokens/
+*.db
+*.sqlite
+*.sqlite3
+
+# Garmin auth cache
+.garminconnect/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
