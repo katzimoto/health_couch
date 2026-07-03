@@ -1,4 +1,13 @@
-"""FastMCP server exposing read-only health tools to ChatGPT Pro.
+"""FastMCP server exposing health tools to ChatGPT Pro.
+
+Mostly read tools over the Garmin-derived metrics, plus a few write tools
+(``log_meal``, ``log_weight``) for data Garmin doesn't provide — nutrition,
+and manual weight entries (e.g. from Apple Health or a scale ChatGPT is told
+about in conversation). ``log_meal`` only ever inserts into the separate
+Meal table. ``log_weight`` upserts the same per-day Weight row the Garmin
+puller writes, so a manual entry for a day the puller later re-syncs will be
+overwritten by the Garmin value — same last-write-wins behaviour re-pulls
+already have.
 
 Runs over streamable HTTP so a public HTTPS URL can reach it. Auth prefers
 OAuth via WorkOS AuthKit (``AUTHKIT_DOMAIN`` + ``MCP_PUBLIC_URL``) — ChatGPT's
@@ -16,6 +25,7 @@ public URL; ChatGPT discovers the OAuth flow automatically.
 from __future__ import annotations
 
 import logging
+from datetime import date
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
@@ -134,6 +144,36 @@ def get_latest_plan() -> dict | None:
     """The most recently generated morning plan (day + full plan text), or
     null if none has been generated yet."""
     return db.last_plan()
+
+
+@mcp.tool
+def log_meal(
+    name: str, calories: int | None = None, day: str | None = None, note: str = ""
+) -> dict:
+    """Log a meal (e.g. from a description, photo, or Apple Health nutrition
+    entry the user gives you). ``day`` defaults to today (ISO ``YYYY-MM-DD``).
+    Returns the day's meals so far."""
+    target_day = day or date.today().isoformat()
+    db.add_meal(name=name, day=target_day, calories=calories, note=note or None)
+    return {"logged": True, "day": target_day, "meals_today": db.recent_meals(days=1)}
+
+
+@mcp.tool
+def get_meals(days: int = 7) -> list[dict]:
+    """Meals logged over the last ``days``, oldest first."""
+    return db.recent_meals(days=max(1, min(days, 365)))
+
+
+@mcp.tool
+def log_weight(
+    weight_kg: float, day: str | None = None, body_fat: float | None = None
+) -> dict:
+    """Log a weight reading (e.g. from Apple Health or a scale the user tells
+    you about). ``day`` defaults to today. Overwrites any existing weight
+    entry for that day, including one from a Garmin sync."""
+    target_day = day or date.today().isoformat()
+    db.upsert_weight(target_day, weight_kg=weight_kg, body_fat=body_fat)
+    return {"logged": True, "day": target_day, "weight_kg": weight_kg, "body_fat": body_fat}
 
 
 def main() -> None:

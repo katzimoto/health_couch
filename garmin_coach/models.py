@@ -107,6 +107,17 @@ class Hydration(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
+class Meal(SQLModel, table=True):
+    """User-logged nutrition (via MCP tool or Telegram) — not pulled from Garmin."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    day: str = Field(index=True)
+    ts: datetime = Field(default_factory=_utcnow)
+    name: str
+    calories: Optional[int] = None
+    note: Optional[str] = None
+
+
 class Conversation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     ts: datetime = Field(default_factory=_utcnow, index=True)
@@ -133,4 +144,5 @@ SUMMARY_COLUMNS = {
     "sleep_score", "sleep_hours", "resting_hr", "hrv", "avg_stress",
     "body_battery_high", "body_battery_low", "steps", "weight_kg",
     "body_fat", "hydration_ml", "training_load", "workout_count",
+    "calories_in",
 }

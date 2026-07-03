@@ -25,6 +25,7 @@ from .models import (
     Feedback,
     Hrv,
     Hydration,
+    Meal,
     Plan,
     RestingHr,
     Sleep,
@@ -55,7 +56,8 @@ SELECT
     w.body_fat                               AS body_fat,
     hy.intake_ml                             AS hydration_ml,
     (SELECT COUNT(*)  FROM workout wo WHERE wo.day = d.day)                       AS workout_count,
-    (SELECT COALESCE(SUM(training_load), 0) FROM workout wo WHERE wo.day = d.day) AS training_load
+    (SELECT COALESCE(SUM(training_load), 0) FROM workout wo WHERE wo.day = d.day) AS training_load,
+    (SELECT COALESCE(SUM(calories), 0) FROM meal me WHERE me.day = d.day)         AS calories_in
 FROM (
     SELECT day FROM sleep
     UNION SELECT day FROM resting_hr
@@ -66,6 +68,7 @@ FROM (
     UNION SELECT day FROM weight
     UNION SELECT day FROM hydration
     UNION SELECT day FROM workout
+    UNION SELECT day FROM meal
 ) d
 LEFT JOIN sleep         sl  ON sl.day  = d.day
 LEFT JOIN resting_hr    rhr ON rhr.day = d.day
@@ -188,6 +191,33 @@ class Database:
                 .limit(days * 3)
             ).all()
         return [r.model_dump() for r in rows]
+
+    # ── Meals (user-logged, not pulled from Garmin) ─────────────────────────────
+
+    def add_meal(
+        self,
+        name: str,
+        day: str | date | None = None,
+        calories: int | None = None,
+        note: str | None = None,
+    ) -> None:
+        with self.session() as s:
+            s.add(
+                Meal(
+                    day=_as_day(day or date.today()),
+                    name=name,
+                    calories=calories,
+                    note=note,
+                )
+            )
+            s.commit()
+
+    def recent_meals(self, days: int = 7) -> list[dict[str, Any]]:
+        with self.session() as s:
+            rows = s.exec(
+                select(Meal).order_by(Meal.day.desc(), Meal.id.desc()).limit(days * 6)
+            ).all()
+        return [r.model_dump() for r in reversed(rows)]
 
     # ── Conversation memory ────────────────────────────────────────────────────
 

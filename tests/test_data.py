@@ -56,6 +56,26 @@ def test_metric_series_rejects_unknown_column(db: Database) -> None:
         db.metric_series("droptable")
 
 
+def test_meals_logged_and_aggregated_into_summary(db: Database) -> None:
+    d = date.today()
+    db.add_meal("oatmeal", day=d, calories=400)
+    db.add_meal("chicken salad", day=d, calories=650, note="lunch")
+    meals = db.recent_meals(days=1)
+    assert [m["name"] for m in meals] == ["oatmeal", "chicken salad"]
+
+    summary = db.daily_summary(days=1)
+    assert summary[0]["calories_in"] == 1050
+
+
+def test_manual_weight_log_overwrites_garmin_weight(db: Database) -> None:
+    d = date.today()
+    db.upsert_weight(d, weight_kg=80.0, body_fat=20.0)
+    db.upsert_weight(d, weight_kg=79.5, body_fat=19.5)  # e.g. a manual log_weight call
+    latest = db.latest_summary()
+    assert latest["weight_kg"] == 79.5
+    assert latest["body_fat"] == 19.5
+
+
 def test_conversation_and_feedback_memory(db: Database) -> None:
     db.add_message("user", "hi")
     db.add_message("assistant", "hello")
