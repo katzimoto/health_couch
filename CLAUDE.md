@@ -39,7 +39,7 @@ There is no lint/typecheck config in this repo — `pytest` is the only checked 
 
 **Security boundaries to preserve:**
 - Only the analyzer's *summaries* are sent to the OpenAI API — never raw DB rows (see `coach.py` docstring).
-- `mcp_server.py` requires `MCP_BEARER_TOKEN` for any deployment reachable via the public tunnel; it logs a loud warning (not an error) if unset.
+- `mcp_server.py` requires OAuth via WorkOS AuthKit (`AUTHKIT_DOMAIN` + `MCP_PUBLIC_URL`) for any deployment reachable publicly — needed for ChatGPT's connector, which requires OAuth rather than a static token. AuthKit is wired as a resource-server-only integration (`AuthKitProvider`): WorkOS runs the actual authorization server (login, consent, PKCE, token issuance) via a hosted AuthKit domain with sign-up disabled and exactly one invited user, and this process only verifies the JWTs WorkOS issues — no custom OAuth server code lives here. Falls back to a static `MCP_BEARER_TOKEN` if AuthKit isn't configured; logs a loud warning (not an error) if neither is set.
 - `telegram_bot.py` restricts all handlers to `TELEGRAM_CHAT_ID` via `_authorized()` so a leaked bot handle can't leak health data or spend API credits.
 - `.env`, `data/`, and `garmin-tokens/` are git-ignored; don't add code paths that would write secrets into the repo or the SQLite file's tracked contents.
 
