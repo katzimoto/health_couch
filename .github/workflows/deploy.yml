@@ -11,7 +11,7 @@ on:
   workflow_dispatch: {}
 
 env:
-  VPS_HOST: 148.113.191.120
+  VPS_HOST: ${{ vars.VPS_HOST }}
   VPS_USER: ubuntu
 
 jobs:
