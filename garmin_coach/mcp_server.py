@@ -25,6 +25,7 @@ public URL; ChatGPT discovers the OAuth flow automatically.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date
 
 from fastmcp import FastMCP
@@ -148,13 +149,31 @@ def get_latest_plan() -> dict | None:
 
 @mcp.tool
 def log_meal(
-    name: str, calories: int | None = None, day: str | None = None, note: str = ""
+    name: str,
+    calories: int | None = None,
+    protein_g: float | None = None,
+    carbs_g: float | None = None,
+    fat_g: float | None = None,
+    fiber_g: float | None = None,
+    sugar_g: float | None = None,
+    day: str | None = None,
+    note: str = "",
 ) -> dict:
     """Log a meal (e.g. from a description, photo, or Apple Health nutrition
-    entry the user gives you). ``day`` defaults to today (ISO ``YYYY-MM-DD``).
-    Returns the day's meals so far."""
+    entry the user gives you). Macros are optional. ``day`` defaults to today
+    (ISO ``YYYY-MM-DD``). Returns the day's meals so far."""
     target_day = day or date.today().isoformat()
-    db.add_meal(name=name, day=target_day, calories=calories, note=note or None)
+    db.add_meal(
+        name=name,
+        day=target_day,
+        calories=calories,
+        protein_g=protein_g,
+        carbs_g=carbs_g,
+        fat_g=fat_g,
+        fiber_g=fiber_g,
+        sugar_g=sugar_g,
+        note=note or None,
+    )
     return {"logged": True, "day": target_day, "meals_today": db.recent_meals(days=1)}
 
 
@@ -174,6 +193,145 @@ def log_weight(
     target_day = day or date.today().isoformat()
     db.upsert_weight(target_day, weight_kg=weight_kg, body_fat=body_fat)
     return {"logged": True, "day": target_day, "weight_kg": weight_kg, "body_fat": body_fat}
+
+
+@mcp.tool
+def log_hydration(intake_ml: int, day: str | None = None, goal_ml: int | None = None) -> dict:
+    """Log water/fluid intake for a day (e.g. from Apple Health). ``day``
+    defaults to today. Overwrites any existing hydration entry for that day,
+    including one from a Garmin sync."""
+    target_day = day or date.today().isoformat()
+    db.upsert_hydration(target_day, intake_ml=intake_ml, goal_ml=goal_ml)
+    return {"logged": True, "day": target_day, "intake_ml": intake_ml}
+
+
+@mcp.tool
+def log_workout(
+    name: str,
+    type: str,
+    day: str | None = None,
+    duration_s: float | None = None,
+    distance_m: float | None = None,
+    calories: int | None = None,
+    avg_hr: int | None = None,
+    max_hr: int | None = None,
+) -> dict:
+    """Log a workout not synced from Garmin (e.g. from Apple Health or a
+    manual description). ``day`` defaults to today. Assigned a synthetic
+    negative activity ID so it never collides with a real Garmin activity."""
+    target_day = day or date.today().isoformat()
+    activity_id = -int(time.time() * 1000)
+    db.upsert_workout(
+        activity_id,
+        target_day,
+        name=name,
+        type=type,
+        duration_s=duration_s,
+        distance_m=distance_m,
+        calories=calories,
+        avg_hr=avg_hr,
+        max_hr=max_hr,
+    )
+    return {"logged": True, "day": target_day, "activity_id": activity_id}
+
+
+@mcp.tool
+def log_vital(
+    metric: str, value: float, unit: str = "", day: str | None = None, note: str = ""
+) -> dict:
+    """Log any biometric reading not covered by a dedicated tool — e.g. blood
+    pressure ("blood_pressure_systolic"/"_diastolic"), "blood_glucose",
+    "oxygen_saturation", "respiratory_rate", "height_cm", or any other named
+    Apple Health metric the user gives you. ``day`` defaults to today."""
+    target_day = day or date.today().isoformat()
+    db.add_vital(metric=metric, value=value, day=target_day, unit=unit or None, note=note or None)
+    return {"logged": True, "day": target_day, "metric": metric, "value": value}
+
+
+@mcp.tool
+def get_vitals(metric: str | None = None, days: int = 30) -> list[dict]:
+    """Vitals logged via log_vital over the last ``days``, oldest first.
+    Pass ``metric`` to filter to one named metric, or omit for all."""
+    return db.recent_vitals(metric=metric, days=max(1, min(days, 365)))
+
+
+@mcp.tool
+def log_apple_health_export(records: list[dict]) -> dict:
+    """Bulk-import structured records read from an Apple Health export (or
+    any other source) in one call, instead of calling the single-item log_*
+    tools in a loop. Read the export yourself (the user will share it, e.g.
+    as a file), extract the values, and pass every record here at once. Each
+    record is a dict shaped like one of:
+
+        {"kind": "weight", "day": "2026-07-01", "weight_kg": 78.2, "body_fat": 18.5}
+        {"kind": "meal", "day": "2026-07-01", "name": "Breakfast", "calories": 350,
+         "protein_g": 20, "carbs_g": 40, "fat_g": 10, "fiber_g": 5, "sugar_g": 8}
+        {"kind": "workout", "day": "2026-07-01", "name": "Run", "type": "running",
+         "duration_s": 1800, "distance_m": 5000, "calories": 320, "avg_hr": 145}
+        {"kind": "hydration", "day": "2026-07-01", "intake_ml": 500}
+        {"kind": "vital", "day": "2026-07-01", "metric": "blood_pressure_systolic",
+         "value": 120, "unit": "mmHg"}
+
+    ``day`` defaults to today if omitted. Every record is applied
+    independently — one bad or malformed record doesn't fail the batch — and
+    per-record status is returned so failures are visible.
+    """
+    results: list[dict] = []
+    for i, rec in enumerate(records):
+        kind = rec.get("kind")
+        day = rec.get("day") or date.today().isoformat()
+        try:
+            if kind == "weight":
+                db.upsert_weight(day, weight_kg=rec["weight_kg"], body_fat=rec.get("body_fat"))
+            elif kind == "meal":
+                db.add_meal(
+                    name=rec["name"],
+                    day=day,
+                    calories=rec.get("calories"),
+                    protein_g=rec.get("protein_g"),
+                    carbs_g=rec.get("carbs_g"),
+                    fat_g=rec.get("fat_g"),
+                    fiber_g=rec.get("fiber_g"),
+                    sugar_g=rec.get("sugar_g"),
+                    note=rec.get("note"),
+                )
+            elif kind == "workout":
+                # Offset by i so a batch generated within the same millisecond
+                # still gets distinct synthetic IDs.
+                db.upsert_workout(
+                    -int(time.time() * 1000) - i,
+                    day,
+                    name=rec.get("name"),
+                    type=rec.get("type"),
+                    duration_s=rec.get("duration_s"),
+                    distance_m=rec.get("distance_m"),
+                    calories=rec.get("calories"),
+                    avg_hr=rec.get("avg_hr"),
+                    max_hr=rec.get("max_hr"),
+                )
+            elif kind == "hydration":
+                db.upsert_hydration(day, intake_ml=rec["intake_ml"], goal_ml=rec.get("goal_ml"))
+            elif kind == "vital":
+                db.add_vital(
+                    metric=rec["metric"],
+                    value=rec["value"],
+                    day=day,
+                    unit=rec.get("unit"),
+                    note=rec.get("note"),
+                )
+            else:
+                results.append({"index": i, "status": f"error: unknown kind {kind!r}"})
+                continue
+            results.append({"index": i, "status": "ok"})
+        except Exception as exc:  # noqa: BLE001 — one bad record must not abort the batch
+            results.append({"index": i, "status": f"error: {exc}"})
+    ok_count = sum(1 for r in results if r["status"] == "ok")
+    return {
+        "total": len(records),
+        "ok": ok_count,
+        "failed": len(records) - ok_count,
+        "results": results,
+    }
 
 
 def main() -> None:

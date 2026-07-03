@@ -31,6 +31,7 @@ from .models import (
     Sleep,
     Steps,
     Stress,
+    Vital,
     Weight,
     Workout,
 )
@@ -199,6 +200,11 @@ class Database:
         name: str,
         day: str | date | None = None,
         calories: int | None = None,
+        protein_g: float | None = None,
+        carbs_g: float | None = None,
+        fat_g: float | None = None,
+        fiber_g: float | None = None,
+        sugar_g: float | None = None,
         note: str | None = None,
     ) -> None:
         with self.session() as s:
@@ -207,6 +213,11 @@ class Database:
                     day=_as_day(day or date.today()),
                     name=name,
                     calories=calories,
+                    protein_g=protein_g,
+                    carbs_g=carbs_g,
+                    fat_g=fat_g,
+                    fiber_g=fiber_g,
+                    sugar_g=sugar_g,
                     note=note,
                 )
             )
@@ -217,6 +228,38 @@ class Database:
             rows = s.exec(
                 select(Meal).order_by(Meal.day.desc(), Meal.id.desc()).limit(days * 6)
             ).all()
+        return [r.model_dump() for r in reversed(rows)]
+
+    # ── Vitals (generic named readings: blood pressure, glucose, SpO2, etc.) ───
+
+    def add_vital(
+        self,
+        metric: str,
+        value: float,
+        day: str | date | None = None,
+        unit: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        with self.session() as s:
+            s.add(
+                Vital(
+                    day=_as_day(day or date.today()),
+                    metric=metric,
+                    value=value,
+                    unit=unit,
+                    note=note,
+                )
+            )
+            s.commit()
+
+    def recent_vitals(
+        self, metric: str | None = None, days: int = 30
+    ) -> list[dict[str, Any]]:
+        with self.session() as s:
+            stmt = select(Vital).order_by(Vital.day.desc(), Vital.id.desc())
+            if metric:
+                stmt = stmt.where(Vital.metric == metric)
+            rows = s.exec(stmt.limit(days * 10)).all()
         return [r.model_dump() for r in reversed(rows)]
 
     # ── Conversation memory ────────────────────────────────────────────────────

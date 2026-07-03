@@ -115,6 +115,25 @@ class Meal(SQLModel, table=True):
     ts: datetime = Field(default_factory=_utcnow)
     name: str
     calories: Optional[int] = None
+    protein_g: Optional[float] = None
+    carbs_g: Optional[float] = None
+    fat_g: Optional[float] = None
+    fiber_g: Optional[float] = None
+    sugar_g: Optional[float] = None
+    note: Optional[str] = None
+
+
+class Vital(SQLModel, table=True):
+    """Generic named biometric reading not covered by a dedicated table —
+    e.g. blood pressure, blood glucose, oxygen saturation, height. Imported
+    from Apple Health or any other source a user describes to the coach."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    day: str = Field(index=True)
+    ts: datetime = Field(default_factory=_utcnow)
+    metric: str = Field(index=True)
+    value: float
+    unit: Optional[str] = None
     note: Optional[str] = None
 
 
