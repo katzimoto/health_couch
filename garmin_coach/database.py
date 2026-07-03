@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from .config import settings
@@ -105,8 +106,15 @@ class Database:
         SQLModel.metadata.create_all(self.engine)
         with self.engine.begin() as conn:
             conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
-            for stmt in filter(None, (s.strip() for s in _DAILY_SUMMARY_VIEW.split(";"))):
-                conn.exec_driver_sql(stmt)
+            try:
+                for stmt in filter(None, (s.strip() for s in _DAILY_SUMMARY_VIEW.split(";"))):
+                    conn.exec_driver_sql(stmt)
+            except OperationalError as exc:
+                # Sibling containers share this SQLite file and each recreate the
+                # view at startup; a concurrent DROP/CREATE from another process
+                # racing this one is harmless since both run identical code.
+                if "already exists" not in str(exc):
+                    raise
 
     # ── Upserts (insert-or-update on primary key) ──────────────────────────────
 
