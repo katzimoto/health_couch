@@ -47,6 +47,21 @@ services:
     depends_on:
       - mcp
 
+  # ── Web dashboard: read-only charts + flags in the browser ────────────────────
+  # Browse at http://<host>:8050. Unauthenticated by default (localhost/LAN);
+  # set DASHBOARD_TOKEN and require ?token=… before exposing it publicly.
+  dashboard:
+    <<: *common
+    command: ["python", "-m", "garmin_coach.webapp"]
+    ports:
+      - "${DASHBOARD_PORT:-8050}:8050"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8050/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   # ── Phase 2/3: two-way Telegram coach ─────────────────────────────────────────
   # Enable once you've set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
   telegram:
