@@ -56,6 +56,11 @@ class Settings:
     mcp_bearer_token: str = field(default_factory=lambda: _get("MCP_BEARER_TOKEN"))
     mcp_host: str = field(default_factory=lambda: _get("MCP_HOST", "0.0.0.0"))
     mcp_port: int = field(default_factory=lambda: _get_int("MCP_PORT", 8000))
+    # OAuth via WorkOS AuthKit (needed for ChatGPT's connector, which requires
+    # OAuth rather than a static bearer token). Falls back to MCP_BEARER_TOKEN
+    # when unset.
+    authkit_domain: str = field(default_factory=lambda: _get("AUTHKIT_DOMAIN"))
+    mcp_public_url: str = field(default_factory=lambda: _get("MCP_PUBLIC_URL"))
 
     # Web dashboard
     dashboard_host: str = field(

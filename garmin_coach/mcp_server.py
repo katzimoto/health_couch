@@ -1,11 +1,16 @@
 """FastMCP server exposing read-only health tools to ChatGPT Pro.
 
-Runs over streamable HTTP so a Cloudflare Tunnel can put it on a public HTTPS
-URL. Protected by a static bearer token (``MCP_BEARER_TOKEN``) — this is your
-health data on the public internet, so the token is required, not optional.
+Runs over streamable HTTP so a public HTTPS URL can reach it. Auth prefers
+OAuth via WorkOS AuthKit (``AUTHKIT_DOMAIN`` + ``MCP_PUBLIC_URL``) — ChatGPT's
+connector requires OAuth, and AuthKit is a resource-server-only integration:
+WorkOS runs the actual authorization server (login, consent, token issuance),
+this process only verifies the JWTs it issues. Sign-up is disabled on the
+AuthKit environment and exactly one user is provisioned, so only the owner can
+ever complete the login step. Falls back to a static bearer token
+(``MCP_BEARER_TOKEN``) if AuthKit isn't configured, for simpler local/test use.
 
 Add the connector in ChatGPT: Settings → Connectors → developer mode → your
-tunnel URL, with an Authorization header of ``Bearer <MCP_BEARER_TOKEN>``.
+public URL; ChatGPT discovers the OAuth flow automatically.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ import logging
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from fastmcp.server.auth.providers.workos import AuthKitProvider
 
 from .analysis import Analyzer
 from .config import settings
@@ -26,9 +32,14 @@ analyzer = Analyzer(db)
 
 
 def _build_server() -> FastMCP:
-    """Construct the FastMCP app, wiring bearer auth when a token is set."""
+    """Construct the FastMCP app, preferring AuthKit OAuth over bearer auth."""
     auth = None
-    if settings.mcp_bearer_token:
+    if settings.authkit_domain and settings.mcp_public_url:
+        auth = AuthKitProvider(
+            authkit_domain=settings.authkit_domain,
+            base_url=settings.mcp_public_url,
+        )
+    elif settings.mcp_bearer_token:
         auth = StaticTokenVerifier(
             tokens={
                 settings.mcp_bearer_token: {
@@ -39,8 +50,8 @@ def _build_server() -> FastMCP:
         )
     else:
         log.warning(
-            "MCP_BEARER_TOKEN is empty — the server will be UNAUTHENTICATED. "
-            "Set a token before exposing it publicly."
+            "Neither AUTHKIT_DOMAIN nor MCP_BEARER_TOKEN is set — the server "
+            "will be UNAUTHENTICATED. Set one before exposing it publicly."
         )
     return FastMCP(name="Health Coach", auth=auth)
 
