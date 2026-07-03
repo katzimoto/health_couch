@@ -78,6 +78,10 @@ def test_token_gate(tmp_path, monkeypatch):
     assert c.get("/api/report?token=nope").status_code == 401
     assert c.get("/api/report?token=sekret").status_code == 200
     assert c.get("/healthz").status_code == 200  # health is always open
+    # Static assets must load without a token, or a gated page renders blank:
+    # the <link>/<script> tags that fetch them can't attach ?token=...
+    assert c.get("/static/style.css").status_code == 200
+    assert c.get("/static/app.js").status_code == 200
 
     # Restore an unauthenticated module state for other tests.
     monkeypatch.delenv("DASHBOARD_TOKEN", raising=False)

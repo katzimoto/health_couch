@@ -92,7 +92,10 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         self.token = token
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/healthz":
+        # Static assets carry no user data and the <link>/<script> tags that
+        # request them can't attach ?token=... themselves, so gating them
+        # would leave the page loading with no CSS/JS whenever a token is set.
+        if request.url.path == "/healthz" or request.url.path.startswith("/static/"):
             return await call_next(request)
         supplied = (
             request.query_params.get("token")
