@@ -40,8 +40,11 @@ class Settings:
         default_factory=lambda: _get("GARMIN_TOKEN_DIR", "/root/.garminconnect")
     )
 
-    # OpenAI
+    # OpenAI-compatible chat completions API. Defaults to OpenAI itself; set
+    # OPENAI_BASE_URL to point the same `openai` SDK at another provider
+    # (OpenRouter, Groq, etc.) — only the endpoint changes, not the client.
     openai_api_key: str = field(default_factory=lambda: _get("OPENAI_API_KEY"))
+    openai_base_url: str = field(default_factory=lambda: _get("OPENAI_BASE_URL"))
     openai_model: str = field(
         default_factory=lambda: _get("OPENAI_MODEL", "gpt-4o-mini")
     )

@@ -75,7 +75,10 @@ class Coach:
         if self._client is None:
             if not settings.openai_api_key:
                 raise RuntimeError("OPENAI_API_KEY is not set.")
-            self._client = OpenAI(api_key=settings.openai_api_key)
+            self._client = OpenAI(
+                api_key=settings.openai_api_key,
+                base_url=settings.openai_base_url or None,
+            )
         return self._client
 
     def _system_prompt(self) -> str:
