@@ -40,8 +40,17 @@ class GarminClient:
         self.api: Garmin | None = None
 
     def login(self) -> None:
-        """Resume a session from the cached token store."""
-        self.api = Garmin()
+        """Resume a session from the cached token store.
+
+        Credentials are passed as a fallback so garminconnect can transparently
+        re-authenticate and re-cache tokens in its current format if the stored
+        ones are rejected (e.g. after a garminconnect upgrade that changes the
+        token format) rather than failing outright.
+        """
+        self.api = Garmin(
+            email=settings.garmin_email or None,
+            password=settings.garmin_password or None,
+        )
         self.api.login(settings.garmin_token_dir)
         log.info("Authenticated to Garmin Connect via cached tokens.")
 
