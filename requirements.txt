@@ -1,6 +1,6 @@
 garminconnect==0.2.25
 sqlmodel==0.0.22
-fastmcp==2.3.4
+fastmcp==2.11.3
 openai==1.55.3
 python-telegram-bot==21.9
 APScheduler==3.10.4
