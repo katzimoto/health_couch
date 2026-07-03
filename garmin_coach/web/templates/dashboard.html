@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Health Coach — Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💪</text></svg>" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">💪</span>
+      <div>
+        <h1>Health Coach</h1>
+        <p class="sub" id="as-of">Loading…</p>
+      </div>
+    </div>
+    <div class="range" role="group" aria-label="Time range">
+      <button data-days="7">7d</button>
+      <button data-days="30" class="active">30d</button>
+      <button data-days="90">90d</button>
+    </div>
+  </header>
+
+  <main id="app">
+    <section id="flags" class="flags" aria-live="polite"></section>
+
+    <section class="cards" id="cards"></section>
+
+    <section class="charts">
+      <div class="chart-card"><h3>Sleep (hours)</h3><div class="chart" data-metric="sleep_hours" data-unit="h"></div></div>
+      <div class="chart-card"><h3>HRV (ms)</h3><div class="chart" data-metric="hrv" data-unit="ms"></div></div>
+      <div class="chart-card"><h3>Resting HR (bpm)</h3><div class="chart" data-metric="resting_hr" data-unit="bpm"></div></div>
+      <div class="chart-card"><h3>Steps</h3><div class="chart" data-metric="steps" data-unit=""></div></div>
+      <div class="chart-card"><h3>Weight (kg)</h3><div class="chart" data-metric="weight_kg" data-unit="kg"></div></div>
+      <div class="chart-card"><h3>Body fat (%)</h3><div class="chart" data-metric="body_fat" data-unit="%"></div></div>
+      <div class="chart-card"><h3>Training load</h3><div class="chart" data-metric="training_load" data-unit=""></div></div>
+      <div class="chart-card"><h3>Avg stress</h3><div class="chart" data-metric="avg_stress" data-unit=""></div></div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    General wellness suggestions, not medical advice · data stays on your machine
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

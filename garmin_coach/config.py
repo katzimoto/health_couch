@@ -57,6 +57,19 @@ class Settings:
     mcp_host: str = field(default_factory=lambda: _get("MCP_HOST", "0.0.0.0"))
     mcp_port: int = field(default_factory=lambda: _get_int("MCP_PORT", 8000))
 
+    # Web dashboard
+    dashboard_host: str = field(
+        default_factory=lambda: _get("DASHBOARD_HOST", "0.0.0.0")
+    )
+    dashboard_port: int = field(
+        default_factory=lambda: _get_int("DASHBOARD_PORT", 8050)
+    )
+    # Optional shared secret; if set, the dashboard requires ?token=... (or an
+    # X-Dashboard-Token header) so it can be exposed publicly behind the tunnel.
+    dashboard_token: str = field(
+        default_factory=lambda: _get("DASHBOARD_TOKEN")
+    )
+
     # Coaching
     coach_goals: str = field(
         default_factory=lambda: _get(

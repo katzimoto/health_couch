@@ -36,6 +36,7 @@ One image, four small containers, one `docker compose up -d`.
 | MCP server | `fastmcp` (HTTP transport, bearer token) |
 | LLM | OpenAI API (`gpt-4o-mini` default) |
 | Telegram | `python-telegram-bot` (long polling) |
+| Web dashboard | Starlette + inline-SVG charts (no JS deps) |
 | Public HTTPS | Cloudflare Tunnel (container) |
 | Scheduling | `APScheduler` (in the scheduler container) |
 | Deployment | Docker Compose |
@@ -59,7 +60,9 @@ health_couch/
 │   ├── coach.py              # OpenAI: daily plan + chat
 │   ├── telegram_bot.py       # two-way coach, feedback capture
 │   ├── mcp_server.py         # FastMCP tools for ChatGPT
-│   └── scheduler.py          # daily pull + 07:30 plan
+│   ├── scheduler.py          # daily pull + 07:30 plan
+│   ├── webapp.py             # Starlette web dashboard + JSON API
+│   └── web/                  # dashboard page, styles, SVG-chart JS
 └── scripts/
     ├── garmin_login.py       # run once to cache tokens
     ├── get_chat_id.py        # find your Telegram chat id
@@ -101,7 +104,17 @@ your Cloudflare Tunnel URL and an `Authorization: Bearer <MCP_BEARER_TOKEN>`
 header. Then ask things like *"Compare my recovery this month vs last and adjust
 my training."*
 
-### 5. Enable the Telegram coach (Phase 2/3)
+### 5. Open the web dashboard
+```bash
+docker compose up -d dashboard
+```
+Browse to `http://<host>:8050` for metric cards, trend deltas, current flags,
+and charts (sleep, HRV, resting HR, steps, weight, body fat, training load,
+stress) with a 7/30/90-day selector. It's read-only and unauthenticated by
+default — keep it on localhost/LAN, or set `DASHBOARD_TOKEN` (then browse with
+`?token=…`) and route it through the tunnel to expose it safely.
+
+### 6. Enable the Telegram coach (Phase 2/3)
 ```bash
 # message your bot once, then:
 docker compose run --rm telegram python scripts/get_chat_id.py
