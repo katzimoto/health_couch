@@ -9,10 +9,16 @@ advice rather than arithmetic.
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from statistics import mean
 from typing import Any
 
 from .database import Database
+
+# Don't compute an acute:chronic ratio until the data spans at least this many
+# days — with a short history the 28-day denominator is mostly imaginary, and a
+# brand-new database would flag a "training spike" on day one.
+_ACR_MIN_HISTORY_DAYS = 21
 
 
 def _avg(values: list[float | int | None]) -> float | None:
@@ -30,14 +36,26 @@ def _series(rows: list[dict[str, Any]], key: str) -> list[float | None]:
     return [r.get(key) for r in rows]
 
 
+def _window(rows: list[dict[str, Any]], days: int) -> list[dict[str, Any]]:
+    """Rows from the last ``days`` *calendar* days (today inclusive).
+
+    The summary only has rows for days with data, so slicing ``rows[-7:]``
+    would silently stretch "the last week" across an arbitrary time span
+    whenever days are missing. Filtering on the day column keeps windows
+    honest.
+    """
+    cutoff = (date.today() - timedelta(days=days - 1)).isoformat()
+    return [r for r in rows if (r.get("day") or "") >= cutoff]
+
+
 class Analyzer:
     def __init__(self, db: Database | None = None) -> None:
         self.db = db or Database()
 
     def _trend(self, rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
         """7-day vs 28-day average and their delta for a single metric."""
-        last7 = _avg(_series(rows[-7:], key))
-        last28 = _avg(_series(rows[-28:], key))
+        last7 = _avg(_series(_window(rows, 7), key))
+        last28 = _avg(_series(_window(rows, 28), key))
         return {"avg_7d": last7, "avg_28d": last28, "delta": _delta(last7, last28)}
 
     def _consecutive_decline(self, rows: list[dict[str, Any]], key: str) -> int:
@@ -52,8 +70,11 @@ class Analyzer:
         return streak
 
     def sleep_debt(self, rows: list[dict[str, Any]], target_hours: float = 8.0) -> float | None:
-        """Cumulative shortfall vs ``target_hours`` over the last 7 nights."""
-        hours = [r.get("sleep_hours") for r in rows[-7:] if r.get("sleep_hours") is not None]
+        """Cumulative shortfall vs ``target_hours`` over the last 7 calendar
+        nights. Nights with no sleep data are skipped (watch not worn is not
+        the same as not sleeping), so this is a lower bound."""
+        week = _window(rows, 7)
+        hours = [r.get("sleep_hours") for r in week if r.get("sleep_hours") is not None]
         if not hours:
             return None
         return round(sum(target_hours - h for h in hours), 1)
@@ -62,11 +83,24 @@ class Analyzer:
         """Acute (7d) vs chronic (28d) daily training load, and their ratio.
 
         >1.5 flags a spike (injury/overtraining risk); <0.8 flags detraining.
+        Days with no data count as zero load — a skipped day is real rest, and
+        dropping it would inflate both averages. The ratio is withheld until
+        the history spans ``_ACR_MIN_HISTORY_DAYS``.
         """
         rows = self.db.daily_summary(days=28)
-        acute = _avg(_series(rows[-7:], "training_load"))
-        chronic = _avg(_series(rows[-28:], "training_load"))
-        ratio = round(acute / chronic, 2) if acute and chronic else None
+
+        def daily_load(days: int) -> float:
+            total = sum(r.get("training_load") or 0 for r in _window(rows, days))
+            return round(total / days, 2)
+
+        acute = daily_load(7)
+        chronic = daily_load(28)
+        history_span = (
+            (date.today() - date.fromisoformat(rows[0]["day"])).days + 1 if rows else 0
+        )
+        ratio = None
+        if chronic > 0 and history_span >= _ACR_MIN_HISTORY_DAYS:
+            ratio = round(acute / chronic, 2)
         return {"acute_7d": acute, "chronic_28d": chronic, "ratio": ratio}
 
     def flags(self, rows: list[dict[str, Any]]) -> list[str]:

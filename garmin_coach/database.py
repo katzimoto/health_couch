@@ -2,14 +2,16 @@
 
 Exposes a small :class:`Database` facade: SQLModel handles the ORM tables while a
 hand-written ``daily_summary`` SQL view stitches the metric families together for
-convenient reads. Upserts use ``session.merge`` (insert-or-update on primary
-key), so re-pulling a day is idempotent.
+convenient reads. Upserts are field-preserving (insert-or-update on primary key,
+never overwriting an existing value with ``None``), so re-pulling a day is
+idempotent and a partial write can't erase data a fuller write already stored.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+import sqlite3
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -27,6 +29,7 @@ from .models import (
     Hydration,
     Meal,
     Plan,
+    PullLog,
     RestingHr,
     Sleep,
     Steps,
@@ -120,39 +123,59 @@ class Database:
                 if "already exists" not in str(exc):
                     raise
 
-    # ── Upserts (insert-or-update on primary key) ──────────────────────────────
+    # ── Upserts (insert-or-update on primary key, field-preserving) ────────────
 
-    def _merge(self, instance: SQLModel) -> None:
+    def _upsert(self, instance: SQLModel) -> None:
+        """Insert, or update only the non-``None`` incoming fields.
+
+        A plain ``session.merge`` replaces *every* column, so a partial write —
+        a Garmin re-pull where one field is missing, or a manual ``log_weight``
+        that only carries weight — would null out values an earlier, fuller
+        write already stored. ``None`` here always means "no data", never
+        "erase", so existing values are kept.
+        """
+        model = type(instance)
+        pk_names = [c.name for c in model.__table__.primary_key.columns]
         with self.session() as s:
-            s.merge(instance)
+            existing = s.get(model, tuple(getattr(instance, n) for n in pk_names))
+            if existing is None:
+                s.add(instance)
+            else:
+                for name in model.model_fields:
+                    if name in pk_names:
+                        continue
+                    value = getattr(instance, name)
+                    if value is not None:
+                        setattr(existing, name, value)
+                s.add(existing)
             s.commit()
 
     def upsert_sleep(self, day: str | date, **f: Any) -> None:
-        self._merge(Sleep(day=_as_day(day), **f))
+        self._upsert(Sleep(day=_as_day(day), **f))
 
     def upsert_hrv(self, day: str | date, **f: Any) -> None:
-        self._merge(Hrv(day=_as_day(day), **f))
+        self._upsert(Hrv(day=_as_day(day), **f))
 
     def upsert_resting_hr(self, day: str | date, **f: Any) -> None:
-        self._merge(RestingHr(day=_as_day(day), **f))
+        self._upsert(RestingHr(day=_as_day(day), **f))
 
     def upsert_stress(self, day: str | date, **f: Any) -> None:
-        self._merge(Stress(day=_as_day(day), **f))
+        self._upsert(Stress(day=_as_day(day), **f))
 
     def upsert_body_battery(self, day: str | date, **f: Any) -> None:
-        self._merge(BodyBattery(day=_as_day(day), **f))
+        self._upsert(BodyBattery(day=_as_day(day), **f))
 
     def upsert_steps(self, day: str | date, **f: Any) -> None:
-        self._merge(Steps(day=_as_day(day), **f))
+        self._upsert(Steps(day=_as_day(day), **f))
 
     def upsert_weight(self, day: str | date, **f: Any) -> None:
-        self._merge(Weight(day=_as_day(day), **f))
+        self._upsert(Weight(day=_as_day(day), **f))
 
     def upsert_hydration(self, day: str | date, **f: Any) -> None:
-        self._merge(Hydration(day=_as_day(day), **f))
+        self._upsert(Hydration(day=_as_day(day), **f))
 
     def upsert_workout(self, activity_id: int, day: str | date, **f: Any) -> None:
-        self._merge(Workout(activity_id=activity_id, day=_as_day(day), **f))
+        self._upsert(Workout(activity_id=activity_id, day=_as_day(day), **f))
 
     # ── Summary reads (raw SQL against the view) ───────────────────────────────
 
@@ -161,11 +184,19 @@ class Database:
             result = s.exec(text(sql).bindparams(**params))
             return [dict(r._mapping) for r in result]
 
+    @staticmethod
+    def _cutoff(days: int) -> str:
+        """ISO day string ``days`` calendar days back, today inclusive."""
+        return (date.today() - timedelta(days=days - 1)).isoformat()
+
     def daily_summary(self, days: int = 30) -> list[dict[str, Any]]:
-        rows = self._view_rows(
-            "SELECT * FROM daily_summary ORDER BY day DESC LIMIT :n", {"n": days}
+        """Rows for the last ``days`` *calendar* days (today inclusive), oldest
+        first. Days with no data at all are absent, not padded — callers doing
+        time-window math must not assume one row per day."""
+        return self._view_rows(
+            "SELECT * FROM daily_summary WHERE day >= :cutoff ORDER BY day",
+            {"cutoff": self._cutoff(days)},
         )
-        return list(reversed(rows))
 
     def latest_summary(self) -> dict[str, Any] | None:
         rows = self._view_rows(
@@ -173,16 +204,20 @@ class Database:
         )
         return rows[0] if rows else None
 
+    def has_data(self) -> bool:
+        """Whether any daily row exists at all (used by the backfill check)."""
+        return self.latest_summary() is not None
+
     def metric_series(self, column: str, days: int = 30) -> list[dict[str, Any]]:
-        """Return ``[{day, value}, ...]`` for one column of the summary view."""
+        """Return ``[{day, value}, ...]`` for one column of the summary view,
+        restricted to the last ``days`` calendar days."""
         if column not in SUMMARY_COLUMNS:
             raise ValueError(f"Unknown metric column: {column}")
-        rows = self._view_rows(
+        return self._view_rows(
             f"SELECT day, {column} AS value FROM daily_summary "
-            f"WHERE {column} IS NOT NULL ORDER BY day DESC LIMIT :n",
-            {"n": days},
+            f"WHERE {column} IS NOT NULL AND day >= :cutoff ORDER BY day",
+            {"cutoff": self._cutoff(days)},
         )
-        return list(reversed(rows))
 
     def recent_workouts(self, days: int = 28) -> list[dict[str, Any]]:
         with self.session() as s:
@@ -299,6 +334,37 @@ class Database:
         with self.session() as s:
             row = s.exec(select(Plan).order_by(Plan.day.desc()).limit(1)).first()
         return {"day": row.day, "plan": row.plan} if row else None
+
+    # ── Pull log (which days Garmin has been pulled for) ───────────────────────
+
+    def record_pull(self, day: str | date, status: dict[str, str]) -> None:
+        self._upsert(PullLog(day=_as_day(day), status=json.dumps(status)))
+
+    def pulled_days(self, start: str | date, end: str | date) -> set[str]:
+        """Days in ``[start, end]`` that have a successful pull recorded."""
+        with self.session() as s:
+            rows = s.exec(
+                select(PullLog.day)
+                .where(PullLog.day >= _as_day(start), PullLog.day <= _as_day(end))
+            ).all()
+        return set(rows)
+
+    # ── Backup ─────────────────────────────────────────────────────────────────
+
+    def backup_to(self, dest: str | Path) -> None:
+        """Copy the live database to ``dest`` with SQLite's online backup API
+        (safe while other containers are writing, unlike a file copy)."""
+        dest = Path(dest).expanduser()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        src = sqlite3.connect(self.path)
+        try:
+            dst = sqlite3.connect(dest)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
 
 
 def as_json(obj: Any) -> str:

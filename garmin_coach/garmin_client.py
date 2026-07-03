@@ -10,6 +10,7 @@ and skipped so one bad endpoint never aborts the whole pull.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, timedelta
 from typing import Any, Callable
 
@@ -19,6 +20,11 @@ from .config import settings
 from .database import Database
 
 log = logging.getLogger("garmin_coach.garmin")
+
+# Pause between multi-day pulls (backfill, gap healing). Each day is ~9 API
+# calls; hammering them back-to-back is what gets long backfills rate-limited
+# and killed mid-run.
+PULL_PAUSE_SECONDS = 1.0
 
 
 def _get(d: Any, *keys: str, default: Any = None) -> Any:
@@ -214,6 +220,11 @@ class GarminClient:
             except Exception as exc:  # noqa: BLE001 — one bad metric must not abort
                 log.warning("Pull failed for %s on %s: %s", name, day_str, exc)
                 results[name] = f"error: {exc}"
+        # Record the day as pulled only if something succeeded: an all-error
+        # day (auth broken, Garmin down) should stay "missing" and be retried
+        # by gap healing, while a day the watch simply had no data should not.
+        if any(status == "ok" for status in results.values()):
+            self.db.record_pull(day_str, results)
         log.info("Pulled %s → %s", day_str, results)
         return results
 
@@ -224,6 +235,38 @@ class GarminClient:
         while current <= end:
             self.pull_day(current)
             current += timedelta(days=1)
+            if current <= end:
+                time.sleep(PULL_PAUSE_SECONDS)
+
+    def pull_missing_days(self, window_days: int | None = None, limit: int = 7) -> list[str]:
+        """Heal gaps: pull up to ``limit`` of the oldest days in the backfill
+        window that have no successful pull recorded.
+
+        This is what actually recovers from an interrupted backfill — the
+        boot-time backfill only runs when the DB is completely empty, and the
+        daily pull only covers yesterday and today, so without this a hole in
+        the middle of the history would never get filled. Bounded per call so
+        the nightly job heals gradually instead of re-triggering the rate
+        limiting that likely caused the gap.
+        """
+        window_days = window_days or settings.backfill_days
+        end = date.today()
+        start = end - timedelta(days=window_days)
+        expected = [
+            (start + timedelta(days=i)).isoformat()
+            for i in range((end - start).days + 1)
+        ]
+        pulled = self.db.pulled_days(expected[0], expected[-1])
+        missing = [d for d in expected if d not in pulled][:limit]
+        if not missing:
+            return []
+        log.info("Healing %d missing day(s): %s", len(missing), missing)
+        self.ensure_login()
+        for i, day in enumerate(missing):
+            if i:
+                time.sleep(PULL_PAUSE_SECONDS)
+            self.pull_day(day)
+        return missing
 
     def backfill(self, days: int | None = None) -> None:
         days = days or settings.backfill_days

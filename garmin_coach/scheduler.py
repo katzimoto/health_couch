@@ -1,11 +1,13 @@
 """Scheduler service — the automation heartbeat.
 
 On startup it ensures the database exists and, if it's empty, runs the initial
-backfill. Then it schedules two recurring jobs with APScheduler:
+backfill. Then it schedules the recurring jobs with APScheduler:
 
 * a daily Garmin pull (early morning, before the plan) that refreshes yesterday
-  and today, and
-* the 07:30 morning-plan push to Telegram.
+  and today, then heals a few days of any backfill gap,
+* the 07:30 morning-plan push to Telegram (retried with backoff on failure),
+* a nightly SQLite backup with rotation, and
+* a liveness heartbeat for the container healthcheck.
 
 Runs as its own container command (``python -m garmin_coach.scheduler``).
 """
@@ -15,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import date, timedelta
+from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -22,6 +25,7 @@ from apscheduler.triggers.cron import CronTrigger
 from .config import settings
 from .database import Database
 from .garmin_client import GarminClient
+from .heartbeat import beat
 from .telegram_bot import TelegramCoach
 
 logging.basicConfig(
@@ -29,6 +33,13 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("garmin_coach.scheduler")
+
+# The morning plan is the headline feature — one transient OpenAI/Telegram
+# error must not skip the day. Waits before attempts 2 and 3.
+_PLAN_RETRY_DELAYS_S = (120, 300)
+
+_BACKUP_KEEP = 7
+_HEARTBEAT_INTERVAL_MIN = 5
 
 
 class SchedulerService:
@@ -38,31 +49,64 @@ class SchedulerService:
         self.telegram = TelegramCoach(self.db)
 
     def daily_pull(self) -> None:
-        """Refresh yesterday and today (today may still be partial)."""
+        """Refresh yesterday and today, then heal a slice of any history gap."""
         log.info("Running daily Garmin pull.")
         try:
             self.garmin.pull_day(date.today() - timedelta(days=1))
             self.garmin.pull_day(date.today())
         except Exception:  # noqa: BLE001
             log.exception("Daily pull failed.")
+        try:
+            self.garmin.pull_missing_days()
+        except Exception:  # noqa: BLE001
+            log.exception("Gap healing failed (will retry tomorrow).")
+        beat("scheduler")
 
     def initial_backfill_if_empty(self) -> None:
-        """Backfill history the first time the DB has no summary rows."""
-        if self.db.daily_summary(days=1):
+        """Backfill history the first time the DB has no summary rows.
+
+        Only the *completely empty* case runs here; a backfill that died
+        partway leaves data behind, and those holes are healed incrementally
+        by ``pull_missing_days`` in the daily pull.
+        """
+        if self.db.has_data():
             log.info("Database already populated — skipping backfill.")
             return
         log.info("Empty database — running %d-day backfill.", settings.backfill_days)
         try:
             self.garmin.backfill()
         except Exception:  # noqa: BLE001
-            log.exception("Backfill failed (will retry on next daily pull).")
+            log.exception(
+                "Backfill failed — remaining days will be healed by the "
+                "nightly gap check."
+            )
 
     async def morning_plan_job(self) -> None:
         log.info("Running morning-plan job.")
+        attempts = 1 + len(_PLAN_RETRY_DELAYS_S)
+        for attempt in range(1, attempts + 1):
+            try:
+                await self.telegram.push_morning_plan()
+                return
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "Morning-plan push failed (attempt %d/%d).", attempt, attempts
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(_PLAN_RETRY_DELAYS_S[attempt - 1])
+        log.error("Morning plan not delivered after %d attempts.", attempts)
+
+    def backup_db(self) -> None:
+        """Nightly online backup of the SQLite file, keeping the newest few."""
+        backups = Path(settings.db_path).expanduser().parent / "backups"
+        dest = backups / f"health-{date.today().isoformat()}.db"
         try:
-            await self.telegram.push_morning_plan()
+            self.db.backup_to(dest)
+            for old in sorted(backups.glob("health-*.db"))[:-_BACKUP_KEEP]:
+                old.unlink()
+            log.info("Backed up database to %s.", dest)
         except Exception:  # noqa: BLE001
-            log.exception("Morning-plan push failed.")
+            log.exception("Database backup failed.")
 
     async def run(self) -> None:
         # Ensure Garmin auth is usable up front so failures are obvious at boot.
@@ -91,15 +135,32 @@ class SchedulerService:
             CronTrigger(hour=hour, minute=minute, timezone=settings.timezone),
             id="morning_plan",
             replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        scheduler.add_job(
+            self.backup_db,
+            CronTrigger(hour=3, minute=0, timezone=settings.timezone),
+            id="db_backup",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            lambda: beat("scheduler"),
+            "interval",
+            minutes=_HEARTBEAT_INTERVAL_MIN,
+            id="heartbeat",
+            replace_existing=True,
         )
         scheduler.start()
+        beat("scheduler")
         log.info(
-            "Scheduler up. Daily pull at %02d:%02d, morning plan at %02d:%02d (%s).",
+            "Scheduler up. Daily pull at %02d:%02d, morning plan at %02d:%02d, "
+            "backup at 03:00 (%s).",
             pull_hour, minute, hour, minute, settings.timezone,
         )
 
-        # Run one pull now so a fresh deploy has current data without waiting.
-        self.daily_pull()
+        # Run one pull now so a fresh deploy has current data without waiting
+        # (in a worker thread — scheduled jobs must not wait behind it).
+        await asyncio.to_thread(self.daily_pull)
 
         # Keep the event loop alive.
         stop = asyncio.Event()

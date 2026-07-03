@@ -17,11 +17,14 @@ services:
   scheduler:
     <<: *common
     command: ["python", "-m", "garmin_coach.scheduler"]
+    # The service touches data/heartbeats/scheduler every 5 minutes; a stale
+    # file means the loop is wedged or dead (an import-only check can't tell).
     healthcheck:
-      test: ["CMD", "python", "-c", "import garmin_coach.scheduler"]
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/app/data/heartbeats/scheduler') < 900 else 1)"]
       interval: 5m
       timeout: 10s
       retries: 3
+      start_period: 5m
 
   # ── Phase 1: FastMCP server for ChatGPT Pro ───────────────────────────────────
   mcp:
@@ -67,8 +70,12 @@ services:
   telegram:
     <<: *common
     command: ["python", "-m", "garmin_coach.telegram_bot"]
+    # The bot touches data/heartbeats/telegram every 60s from its event loop,
+    # so a wedged loop (e.g. blocked on a sync call) turns the container
+    # unhealthy instead of passing an import-only check.
     healthcheck:
-      test: ["CMD", "python", "-c", "import garmin_coach.telegram_bot"]
-      interval: 5m
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/app/data/heartbeats/telegram') < 300 else 1)"]
+      interval: 1m
       timeout: 10s
       retries: 3
+      start_period: 2m

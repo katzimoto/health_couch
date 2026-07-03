@@ -20,6 +20,7 @@ default it's unauthenticated and meant for localhost / LAN use.
 from __future__ import annotations
 
 import logging
+import secrets
 from pathlib import Path
 
 import uvicorn
@@ -97,11 +98,17 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         # would leave the page loading with no CSS/JS whenever a token is set.
         if request.url.path == "/healthz" or request.url.path.startswith("/static/"):
             return await call_next(request)
+        # Prefer the header where possible: ?token=... ends up in access logs
+        # along the way (tunnel, proxies). The query form stays supported
+        # because a browser bookmark can't set headers.
         supplied = (
             request.query_params.get("token")
             or request.headers.get("x-dashboard-token")
+            or ""
         )
-        if supplied != self.token:
+        # compare_digest: constant-time, so response timing can't be used to
+        # guess the token byte by byte.
+        if not secrets.compare_digest(supplied.encode(), self.token.encode()):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
