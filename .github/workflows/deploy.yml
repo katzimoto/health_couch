@@ -1,0 +1,50 @@
+name: Deploy
+
+# Ships every push to main straight to the VPS: syncs tracked files over SSH,
+# rebuilds the Docker image, and restarts the four services. Deliberately does
+# NOT delete anything on the VPS outside the synced tree — .env, data/, and
+# garmin-tokens/ are gitignored and never touched by this workflow.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  VPS_HOST: 148.113.191.120
+  VPS_USER: ubuntu
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync tracked files to VPS
+        run: |
+          tar -cf - --exclude='.git' --exclude='.github' . | \
+            ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" "tar -xf - -C ~/health_couch"
+
+      - name: Build and restart services
+        run: |
+          ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" '
+            set -e
+            cd ~/health_couch
+            docker compose build
+            docker compose up -d scheduler mcp dashboard telegram
+          '
+
+      - name: Show service status
+        run: |
+          sleep 10
+          ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" '
+            cd ~/health_couch
+            docker compose ps -a --format "table {{.Name}}\t{{.Status}}"
+          '
