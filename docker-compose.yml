@@ -1,0 +1,59 @@
+# Health Coach — the whole system in one `docker compose up -d`.
+#
+# One image (Dockerfile), several lightweight containers, each just a different
+# command. Phases map to services: start with scheduler + mcp + tunnel; enable
+# `telegram` when you're ready for Phase 2/3.
+
+x-common: &common
+  build: .
+  restart: unless-stopped
+  env_file: .env
+  volumes:
+    - ./data:/app/data                    # SQLite database lives here
+    - ./garmin-tokens:/root/.garminconnect # Garmin auth tokens
+
+services:
+  # ── Phase 1/2: daily Garmin pull + 07:30 morning plan ─────────────────────────
+  scheduler:
+    <<: *common
+    command: ["python", "-m", "garmin_coach.scheduler"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import garmin_coach.scheduler"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+
+  # ── Phase 1: FastMCP server for ChatGPT Pro ───────────────────────────────────
+  mcp:
+    <<: *common
+    command: ["python", "-m", "garmin_coach.mcp_server"]
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,os; s=socket.create_connection(('127.0.0.1', int(os.getenv('MCP_PORT','8000'))), 3); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── Phase 1: Cloudflare Tunnel → public HTTPS for the MCP server ──────────────
+  # Provides a public HTTPS URL for `mcp` with no open ports / certificates.
+  # Set CLOUDFLARE_TUNNEL_TOKEN in .env (Zero Trust dashboard) and point the
+  # tunnel's public hostname at http://mcp:8000.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN}"]
+    depends_on:
+      - mcp
+
+  # ── Phase 2/3: two-way Telegram coach ─────────────────────────────────────────
+  # Enable once you've set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
+  telegram:
+    <<: *common
+    command: ["python", "-m", "garmin_coach.telegram_bot"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import garmin_coach.telegram_bot"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
