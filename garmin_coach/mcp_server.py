@@ -114,6 +114,28 @@ def get_flags() -> dict:
     }
 
 
+@mcp.tool
+def get_full_report() -> dict:
+    """Complete analyzer report in one call: latest daily summary, 7d-vs-28d
+    trends for every tracked metric (sleep, HRV, resting HR, steps, stress,
+    weight, body fat), sleep debt, acute:chronic training load, and flags."""
+    return analyzer.report()
+
+
+@mcp.tool
+def get_feedback(days: int = 30) -> list[dict]:
+    """Feedback notes logged via the Telegram coach (/done, /skipped, /felt)
+    over the last ``days``, oldest first."""
+    return db.recent_feedback(days=max(1, min(days, 365)))
+
+
+@mcp.tool
+def get_latest_plan() -> dict | None:
+    """The most recently generated morning plan (day + full plan text), or
+    null if none has been generated yet."""
+    return db.last_plan()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     log.info("Starting MCP server on %s:%s", settings.mcp_host, settings.mcp_port)
