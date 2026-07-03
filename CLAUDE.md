@@ -1,0 +1,48 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A personal server that pulls Garmin Connect data daily into SQLite, exposes it to ChatGPT Pro via an MCP connector, and runs a two-way Telegram coach (OpenAI-backed) that pushes a 07:30 morning plan and answers questions grounded in the user's own data. One Docker image, several containers each running a different command (see `docker-compose.yml`).
+
+## Commands
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+
+python -m pytest                    # offline tests (DB + analysis), no network needed
+python -m pytest tests/test_data.py::test_analyzer_report_and_flags   # single test
+
+docker compose up -d scheduler mcp tunnel   # Phase 1: data + ChatGPT connector
+docker compose up -d telegram               # Phase 2/3: enable the Telegram coach
+docker compose logs -f <service>            # scheduler | mcp | tunnel | telegram
+docker compose run --rm scheduler python scripts/garmin_login.py   # cache Garmin tokens (once, or after ~6mo expiry)
+docker compose run --rm scheduler python scripts/backfill.py 180   # backfill N days on demand
+docker compose run --rm telegram python scripts/get_chat_id.py     # find your Telegram chat id
+```
+
+There is no lint/typecheck config in this repo — `pytest` is the only checked command.
+
+## Architecture
+
+**One image, several roles.** `Dockerfile` builds a single image; `docker-compose.yml` runs it as four services that differ only in their `command`: `scheduler` (APScheduler: daily Garmin pull + 07:30 plan push), `mcp` (FastMCP HTTP server for ChatGPT), `tunnel` (Cloudflare Tunnel, exposes `mcp` publicly), `telegram` (long-polling bot). All services share `./data` (SQLite) and `./garmin-tokens` (Garmin auth) as mounted volumes.
+
+**Data flow:** `garmin_client.py` (`GarminClient`) pulls per-metric data from Garmin Connect into SQLModel tables in `database.py`/`models.py`, keyed by `day` (ISO string) so re-pulls upsert via `session.merge` rather than duplicate. `analysis.py` (`Analyzer`) reads a hand-written `daily_summary` SQL view (joins all metric tables, recreated on every DB init in `database.py`) and computes 7d-vs-28d trends, sleep debt, acute:chronic training-load ratio, and plain-language flags. `coach.py` (`Coach`) feeds that analyzer report (never raw DB rows) into an OpenAI system prompt to produce either a structured morning plan or a free-text chat reply, with conversation history persisted in the `Conversation` table for multi-turn memory. Both `mcp_server.py` and `telegram_bot.py` are thin consumers of `Coach`/`Analyzer`/`Database`.
+
+**Config is centralized:** every module reads `garmin_coach.config.settings` (a frozen dataclass populated once from `.env`/env vars) rather than touching `os.environ` directly.
+
+**Failure isolation is a deliberate pattern**, not an oversight — preserve it when touching these paths:
+- `garmin_client.py`: every per-metric pull (`_pull_sleep`, `_pull_hrv`, etc.) is wrapped individually in `pull_day`, so one broken Garmin endpoint doesn't abort the rest of the day's pull. The `_get` helper walks nested dict/list keys defensively since Garmin's undocumented JSON shape varies by device/firmware.
+- `scheduler.py`: Garmin login failure at boot, backfill failure, and each scheduled job are all caught and logged individually so the container stays up and jobs retry on their own schedule.
+
+**Security boundaries to preserve:**
+- Only the analyzer's *summaries* are sent to the OpenAI API — never raw DB rows (see `coach.py` docstring).
+- `mcp_server.py` requires `MCP_BEARER_TOKEN` for any deployment reachable via the public tunnel; it logs a loud warning (not an error) if unset.
+- `telegram_bot.py` restricts all handlers to `TELEGRAM_CHAT_ID` via `_authorized()` so a leaked bot handle can't leak health data or spend API credits.
+- `.env`, `data/`, and `garmin-tokens/` are git-ignored; don't add code paths that would write secrets into the repo or the SQLite file's tracked contents.
+
+## Adding a new Garmin metric
+
+Touches four places in order: add a table to `models.py`, add it to the `daily_summary` view + an `upsert_*` method in `database.py`, add a `_pull_*` extractor wired into the `pulls` dict in `garmin_client.py`, and if it should be queryable by column name, add it to `SUMMARY_COLUMNS` in `models.py`.
