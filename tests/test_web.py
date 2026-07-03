@@ -13,9 +13,16 @@ from starlette.testclient import TestClient
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "web.db"))
     monkeypatch.delenv("DASHBOARD_TOKEN", raising=False)
-    # Reload config + webapp so they pick up the temp DB path.
+    # Reload config and every module that captured `settings` at import time
+    # (database, analysis) before webapp, or Database() falls back to a stale
+    # db_path from whichever process/test imported it first — which can be a
+    # real, non-temp database if one happens to be mounted at that path.
     import garmin_coach.config as config
     importlib.reload(config)
+    import garmin_coach.database as database
+    importlib.reload(database)
+    import garmin_coach.analysis as analysis
+    importlib.reload(analysis)
     import garmin_coach.webapp as webapp
     importlib.reload(webapp)
 
@@ -59,6 +66,10 @@ def test_token_gate(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_TOKEN", "sekret")
     import garmin_coach.config as config
     importlib.reload(config)
+    import garmin_coach.database as database
+    importlib.reload(database)
+    import garmin_coach.analysis as analysis
+    importlib.reload(analysis)
     import garmin_coach.webapp as webapp
     importlib.reload(webapp)
 
@@ -71,4 +82,6 @@ def test_token_gate(tmp_path, monkeypatch):
     # Restore an unauthenticated module state for other tests.
     monkeypatch.delenv("DASHBOARD_TOKEN", raising=False)
     importlib.reload(config)
+    importlib.reload(database)
+    importlib.reload(analysis)
     importlib.reload(webapp)
