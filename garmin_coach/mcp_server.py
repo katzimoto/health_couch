@@ -5,9 +5,8 @@ Mostly read tools over the Garmin-derived metrics, plus a few write tools
 and manual weight entries (e.g. from Apple Health or a scale ChatGPT is told
 about in conversation). ``log_meal`` only ever inserts into the separate
 Meal table. ``log_weight`` upserts the same per-day Weight row the Garmin
-puller writes, so a manual entry for a day the puller later re-syncs will be
-overwritten by the Garmin value — same last-write-wins behaviour re-pulls
-already have.
+puller writes: whichever source writes a field last wins, but a write never
+blanks fields it doesn't carry (upserts are field-preserving).
 
 Runs over streamable HTTP so a public HTTPS URL can reach it. Auth prefers
 OAuth via WorkOS AuthKit (``AUTHKIT_DOMAIN`` + ``MCP_PUBLIC_URL``) — ChatGPT's
@@ -24,6 +23,7 @@ public URL; ChatGPT discovers the OAuth flow automatically.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import time
 from datetime import date
@@ -68,6 +68,15 @@ def _build_server() -> FastMCP:
 
 
 mcp = _build_server()
+
+# Synthetic (negative) activity IDs for manually logged workouts. Time-based so
+# they can never collide with Garmin's positive IDs across restarts; the
+# counter disambiguates calls that land in the same millisecond.
+_synthetic_seq = itertools.count()
+
+
+def _synthetic_activity_id() -> int:
+    return -(int(time.time() * 1000) * 1000 + next(_synthetic_seq) % 1000)
 
 
 @mcp.tool
@@ -188,8 +197,9 @@ def log_weight(
     weight_kg: float, day: str | None = None, body_fat: float | None = None
 ) -> dict:
     """Log a weight reading (e.g. from Apple Health or a scale the user tells
-    you about). ``day`` defaults to today. Overwrites any existing weight
-    entry for that day, including one from a Garmin sync."""
+    you about). ``day`` defaults to today. Updates the provided fields on that
+    day's entry (a later Garmin sync may update them again); other body-comp
+    fields already stored for the day are kept."""
     target_day = day or date.today().isoformat()
     db.upsert_weight(target_day, weight_kg=weight_kg, body_fat=body_fat)
     return {"logged": True, "day": target_day, "weight_kg": weight_kg, "body_fat": body_fat}
@@ -198,8 +208,8 @@ def log_weight(
 @mcp.tool
 def log_hydration(intake_ml: int, day: str | None = None, goal_ml: int | None = None) -> dict:
     """Log water/fluid intake for a day (e.g. from Apple Health). ``day``
-    defaults to today. Overwrites any existing hydration entry for that day,
-    including one from a Garmin sync."""
+    defaults to today. Updates the provided fields on that day's entry (a
+    later Garmin sync may update them again)."""
     target_day = day or date.today().isoformat()
     db.upsert_hydration(target_day, intake_ml=intake_ml, goal_ml=goal_ml)
     return {"logged": True, "day": target_day, "intake_ml": intake_ml}
@@ -220,7 +230,7 @@ def log_workout(
     manual description). ``day`` defaults to today. Assigned a synthetic
     negative activity ID so it never collides with a real Garmin activity."""
     target_day = day or date.today().isoformat()
-    activity_id = -int(time.time() * 1000)
+    activity_id = _synthetic_activity_id()
     db.upsert_workout(
         activity_id,
         target_day,
@@ -296,10 +306,8 @@ def log_apple_health_export(records: list[dict]) -> dict:
                     note=rec.get("note"),
                 )
             elif kind == "workout":
-                # Offset by i so a batch generated within the same millisecond
-                # still gets distinct synthetic IDs.
                 db.upsert_workout(
-                    -int(time.time() * 1000) - i,
+                    _synthetic_activity_id(),
                     day,
                     name=rec.get("name"),
                     type=rec.get("type"),

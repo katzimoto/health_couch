@@ -20,7 +20,9 @@ def db(tmp_path) -> Database:
 
 
 def _seed(db: Database, days: int = 30) -> None:
-    for i in range(days, 0, -1):
+    # Today inclusive: the analyzer windows are calendar-based, so a seed that
+    # stopped at yesterday would leave today as a (deliberate) hole.
+    for i in range(days - 1, -1, -1):
         d = date.today() - timedelta(days=i)
         db.upsert_sleep(d, score=80, total_seconds=7 * 3600, resting_hr=50)
         db.upsert_hrv(d, last_night_avg=60, weekly_avg=60, status="BALANCED")
@@ -97,6 +99,70 @@ def test_analyzer_report_and_flags(db: Database) -> None:
     # Steady 7h sleep vs 8h target => ~7h debt over the week => flagged.
     assert report["sleep_debt_7d"] == pytest.approx(7.0, abs=0.1)
     assert any("Sleep debt" in f for f in report["flags"])
+
+
+def test_partial_upsert_preserves_existing_fields(db: Database) -> None:
+    from garmin_coach.models import Weight
+
+    d = date.today()
+    db.upsert_weight(d, weight_kg=80.0, body_fat=20.0, muscle_kg=35.0)
+    db.upsert_weight(d, weight_kg=79.0)  # e.g. a manual log_weight call
+    latest = db.latest_summary()
+    assert latest["weight_kg"] == 79.0
+    assert latest["body_fat"] == 20.0  # not blanked by the partial write
+    with db.session() as s:
+        row = s.get(Weight, d.isoformat())
+    assert row.muscle_kg == 35.0
+
+
+def test_repull_with_missing_field_keeps_stored_value(db: Database) -> None:
+    d = date.today()
+    db.upsert_sleep(d, score=90, total_seconds=8 * 3600)
+    # Garmin re-pull where the score isn't computed (yet / anymore).
+    db.upsert_sleep(d, score=None, total_seconds=8 * 3600 + 60)
+    summary = db.daily_summary(days=1)
+    assert summary[0]["sleep_score"] == 90
+    assert summary[0]["sleep_hours"] == pytest.approx(8.02, abs=0.01)
+
+
+def test_analyzer_windows_are_calendar_days(db: Database) -> None:
+    # Data only 10-20 days ago; the last week is a genuine gap (watch off).
+    for i in range(10, 21):
+        d = date.today() - timedelta(days=i)
+        db.upsert_sleep(d, score=80, total_seconds=7 * 3600)
+    report = Analyzer(db).report()
+    trend = report["trends"]["sleep_hours"]
+    # Row-slicing would have treated the 7 newest *rows* as "this week".
+    assert trend["avg_7d"] is None
+    assert trend["avg_28d"] == 7.0
+    assert report["sleep_debt_7d"] is None
+
+
+def test_acr_counts_missing_days_as_rest(db: Database) -> None:
+    # Anchor the history span, then train hard only in the last 7 days.
+    db.upsert_steps(date.today() - timedelta(days=27), steps=4000)
+    for i in range(7):
+        d = date.today() - timedelta(days=i)
+        db.upsert_workout(2000 + i, d, name="Run", type="running", training_load=70)
+    acr = Analyzer(db).acute_chronic_ratio()
+    assert acr["acute_7d"] == 70.0
+    assert acr["chronic_28d"] == pytest.approx(17.5)  # 7*70 over 28 calendar days
+    assert acr["ratio"] == 4.0
+
+
+def test_acr_ratio_withheld_for_short_history(db: Database) -> None:
+    # Only 5 days of history: a 28-day baseline would be fiction, and the
+    # ratio would flag a "spike" on a brand-new database.
+    for i in range(5):
+        d = date.today() - timedelta(days=i)
+        db.upsert_workout(3000 + i, d, name="Run", type="running", training_load=50)
+    assert Analyzer(db).acute_chronic_ratio()["ratio"] is None
+
+
+def test_pull_log_roundtrip(db: Database) -> None:
+    db.record_pull("2026-07-01", {"sleep": "ok"})
+    db.record_pull(date(2026, 7, 2), {"sleep": "ok", "hrv": "error: boom"})
+    assert db.pulled_days("2026-06-30", "2026-07-03") == {"2026-07-01", "2026-07-02"}
 
 
 def test_analyzer_flags_hrv_decline(db: Database) -> None:

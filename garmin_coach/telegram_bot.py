@@ -15,6 +15,7 @@ stranger read your health data or spend your API credits.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from telegram import Update
@@ -30,8 +31,11 @@ from telegram.ext import (
 from .coach import Coach
 from .config import settings
 from .database import Database
+from .heartbeat import beat
 
 log = logging.getLogger("garmin_coach.telegram")
+
+_HEARTBEAT_INTERVAL_S = 60
 
 
 class TelegramCoach:
@@ -73,16 +77,20 @@ class TelegramCoach:
             return await self._deny(update)
         await update.effective_chat.send_action(ChatAction.TYPING)
         try:
-            text = self.coach.morning_plan()
-        except Exception as exc:  # noqa: BLE001
+            # to_thread: the OpenAI call takes seconds and would otherwise
+            # freeze polling and every other handler for its whole duration.
+            text = await asyncio.to_thread(self.coach.morning_plan)
+        except Exception:  # noqa: BLE001
             log.exception("Plan generation failed")
-            text = f"⚠️ Couldn't generate a plan: {exc}"
+            # Exception text can leak internals (URLs, key fragments) — keep
+            # the details in the log.
+            text = "⚠️ Couldn't generate a plan right now. Check the server logs."
         await update.message.reply_text(text)
 
     async def status(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return await self._deny(update)
-        report = self.coach.analysis_snapshot()
+        report = await asyncio.to_thread(self.coach.analysis_snapshot)
         if not report.get("available"):
             await update.message.reply_text(
                 "No data yet — run a Garmin pull/backfill first."
@@ -125,7 +133,7 @@ class TelegramCoach:
         }.get(command, extra or "felt: (no detail)")
         if command == "felt":
             note = f"Felt: {extra}" if extra else "Felt: (no detail)"
-        self.db.add_feedback(note)
+        await asyncio.to_thread(self.db.add_feedback, note)
         await update.message.reply_text("Logged 👍 — I'll factor that into tomorrow.")
 
     async def message(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -136,10 +144,10 @@ class TelegramCoach:
             return
         await update.effective_chat.send_action(ChatAction.TYPING)
         try:
-            reply = self.coach.chat(text)
-        except Exception as exc:  # noqa: BLE001
+            reply = await asyncio.to_thread(self.coach.chat, text)
+        except Exception:  # noqa: BLE001
             log.exception("Chat failed")
-            reply = f"⚠️ Something went wrong: {exc}"
+            reply = "⚠️ Something went wrong. Check the server logs."
         await update.message.reply_text(reply)
 
     # ── Push + run ─────────────────────────────────────────────────────────────
@@ -153,7 +161,9 @@ class TelegramCoach:
         if not self._allowed:
             log.error("TELEGRAM_CHAT_ID not set — cannot push morning plan.")
             return
-        text = self.coach.morning_plan()
+        # reuse_today: on a retry after a failed *send*, resend the plan that
+        # was already generated and saved instead of paying for a new one.
+        text = await asyncio.to_thread(self.coach.morning_plan, reuse_today=True)
         owns_app = app is None
         if owns_app:
             app = Application.builder().token(settings.telegram_bot_token).build()
@@ -165,8 +175,22 @@ class TelegramCoach:
             if owns_app:
                 await app.shutdown()
 
+    async def _heartbeat_loop(self) -> None:
+        """Touch the liveness file as long as the event loop is responsive."""
+        while True:
+            beat("telegram")
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+
+    async def _post_init(self, _app: Application) -> None:
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
     def build_app(self) -> Application:
-        app = Application.builder().token(settings.telegram_bot_token).build()
+        app = (
+            Application.builder()
+            .token(settings.telegram_bot_token)
+            .post_init(self._post_init)
+            .build()
+        )
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("plan", self.plan))
         app.add_handler(CommandHandler("status", self.status))

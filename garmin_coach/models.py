@@ -157,6 +157,20 @@ class Plan(SQLModel, table=True):
     plan: str
 
 
+class PullLog(SQLModel, table=True):
+    """One row per day successfully pulled from Garmin.
+
+    Lets the scheduler distinguish "never pulled" from "pulled but the watch
+    had no data", so it can heal gaps (e.g. an interrupted backfill) without
+    re-pulling genuinely empty days forever.
+    """
+
+    __tablename__ = "pull_log"
+    day: str = Field(primary_key=True)
+    ts: datetime = Field(default_factory=_utcnow)
+    status: Optional[str] = None  # JSON of per-metric results from pull_day
+
+
 # Map metric-summary column names to the underlying table+model so the
 # database layer can validate/route generic queries.
 SUMMARY_COLUMNS = {

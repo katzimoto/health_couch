@@ -102,8 +102,19 @@ class Coach:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def morning_plan(self) -> str:
-        """Generate and persist today's structured plan."""
+    def morning_plan(self, reuse_today: bool = False) -> str:
+        """Generate and persist today's structured plan.
+
+        With ``reuse_today``, return the already-saved plan if one exists for
+        today instead of generating again — used by the scheduler's retry path
+        so a failed *send* doesn't pay for (and re-seed memory with) a second
+        generation.
+        """
+        if reuse_today:
+            existing = self.db.last_plan()
+            if existing and existing.get("day") == date.today().isoformat():
+                log.info("Reusing today's saved morning plan.")
+                return existing["plan"]
         messages = [
             {"role": "system", "content": self._system_prompt()},
             {
