@@ -9,13 +9,16 @@ idempotent and a partial write can't erase data a fuller write already stored.
 Schema evolution: ``create_all`` only creates *missing tables* — it never alters
 existing ones, so a model gaining a column would otherwise break inserts against
 databases created before the column existed. ``init_schema`` therefore also
-reconciles columns (``_migrate_missing_columns``): any nullable model column
-absent from the live table is added via ``ALTER TABLE ... ADD COLUMN``, which is
-additive, lossless, and idempotent.
+upgrades to the Alembic head (revision scripts in ``garmin_coach/alembic``, for
+data fixes and anything with intent) and then reconciles columns
+(``_migrate_missing_columns``): any nullable model column absent from the live
+table is added via ``ALTER TABLE ... ADD COLUMN``, which is additive, lossless,
+and idempotent.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import sqlite3
@@ -23,6 +26,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -122,6 +127,7 @@ class Database:
 
     def init_schema(self) -> None:
         SQLModel.metadata.create_all(self.engine)
+        self._upgrade_to_alembic_head()
         self._migrate_missing_columns()
         with self.engine.begin() as conn:
             conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
@@ -134,6 +140,32 @@ class Database:
                 # racing this one is harmless since both run identical code.
                 if "already exists" not in str(exc):
                     raise
+
+    def _alembic_config(self) -> AlembicConfig:
+        cfg = AlembicConfig()
+        cfg.set_main_option(
+            "script_location", str(Path(__file__).resolve().parent / "alembic")
+        )
+        # Share this engine so migrations inherit the 30s busy timeout —
+        # essential with four containers upgrading one SQLite file at boot.
+        cfg.attributes["engine"] = self.engine
+        return cfg
+
+    def _upgrade_to_alembic_head(self) -> None:
+        """Apply pending Alembic revisions under a cross-container file lock.
+
+        The lock file lives next to the DB on the shared volume, so exactly
+        one container performs each upgrade; the others block briefly, then
+        find head already applied (a no-op). Operations are also written
+        guarded/idempotent as a second line of defence.
+        """
+        lock_path = Path(self.path).expanduser().parent / ".migrations.lock"
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                alembic_command.upgrade(self._alembic_config(), "head")
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def _migrate_missing_columns(self) -> None:
         """Add model columns missing from existing tables (additive, lossless).

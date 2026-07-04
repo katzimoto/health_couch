@@ -48,3 +48,12 @@ There is no lint/typecheck config in this repo — `pytest` is the only checked 
 ## Adding a new Garmin metric
 
 Touches four places in order: add a table to `models.py`, add it to the `daily_summary` view + an `upsert_*` method in `database.py`, add a `_pull_*` extractor wired into the `pulls` dict in `garmin_client.py`, and if it should be queryable by column name, add it to `SUMMARY_COLUMNS` in `models.py`.
+
+## Schema changes and migrations
+
+`create_all` never alters existing tables, so live databases need explicit evolution — both layers run automatically on every startup (`Database.init_schema`):
+- **New nullable column on an existing table:** just add it to the model. The generic reconciler (`Database._migrate_missing_columns`) adds it via `ALTER TABLE … ADD COLUMN`, backfilled as `NULL`.
+- **Anything else** (data backfills, indexes, NOT NULL columns, renames): an Alembic revision. The environment lives *inside the package* (`garmin_coach/alembic/` — deliberately, so the Docker image ships it; `alembic.ini` at the root is only for the CLI). Create one with `alembic revision -m "..."` (or `--autogenerate`), put the real logic in `garmin_coach/migrations.py` as a plain-`Connection` function the revision script calls — that keeps it unit-testable — and write it guarded/idempotent (table/column-existence checks), because startup order is `create_all` → `upgrade head`, so on fresh databases the tables already exist in final shape and revisions must no-op cleanly. Startup upgrades run under a cross-container file lock (`data/.migrations.lock`) since all four services boot against one SQLite file.
+- New *tables* need nothing: `create_all` handles them.
+
+Every deploy also snapshots the DB first (`data/backups/pre-deploy-*.db`, newest 7 kept — see `.github/workflows/deploy.yml`), so any migration can be rolled back to the exact pre-deploy state.

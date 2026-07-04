@@ -1,5 +1,6 @@
 garminconnect==0.3.6
 sqlmodel==0.0.39
+alembic==1.18.5
 fastmcp==3.4.2
 openai==2.44.0
 python-telegram-bot==22.8
