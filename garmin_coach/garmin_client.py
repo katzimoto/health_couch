@@ -18,6 +18,7 @@ from garminconnect import Garmin
 
 from .config import settings
 from .database import Database
+from .training_load import estimate_training_load
 
 log = logging.getLogger("garmin_coach.garmin")
 
@@ -182,17 +183,29 @@ class GarminClient:
             aid = _get(act, "activityId")
             if aid is None:
                 continue
+            load = _get(act, "activityTrainingLoad")
+            wtype = _get(act, "activityType", "typeKey")
+            duration = _get(act, "duration")
+            avg_hr = _get(act, "averageHR")
+            load_source = "garmin"
+            if load is None:
+                # Garmin omits load on some activities (walks, manual entries);
+                # estimate so the acute:chronic math doesn't read them as rest.
+                load = estimate_training_load(wtype, duration, avg_hr=avg_hr)
+                load_source = "estimated" if load is not None else None
             self.db.upsert_workout(
                 int(aid),
                 day,
                 name=_get(act, "activityName"),
-                type=_get(act, "activityType", "typeKey"),
-                duration_s=_get(act, "duration"),
+                type=wtype,
+                duration_s=duration,
                 distance_m=_get(act, "distance"),
                 calories=_get(act, "calories"),
-                avg_hr=_get(act, "averageHR"),
+                avg_hr=avg_hr,
                 max_hr=_get(act, "maxHR"),
-                training_load=_get(act, "activityTrainingLoad"),
+                training_load=load,
+                source="garmin",
+                load_source=load_source,
             )
 
     # ── Orchestration ──────────────────────────────────────────────────────────

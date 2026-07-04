@@ -38,6 +38,7 @@ from sqlmodel import select
 
 from .database import Database
 from .models import Meal, Vital
+from .training_load import estimate_training_load
 
 log = logging.getLogger("garmin_coach.apple_health")
 
@@ -204,15 +205,20 @@ class _Aggregates:
 
         wtype = _workout_type(hk_type)
         calories = num("totalEnergyBurned", _TO_KCAL, "totalEnergyBurnedUnit")
+        duration_s = num("duration", _TO_S, "durationUnit")
+        load = estimate_training_load(wtype, duration_s)
         self.workouts.append(
             {
                 "activity_id": _workout_id(start, hk_type),
                 "day": _day_of(start),
                 "name": wtype.replace("_", " ").title(),
                 "type": wtype,
-                "duration_s": num("duration", _TO_S, "durationUnit"),
+                "duration_s": duration_s,
                 "distance_m": num("totalDistance", _TO_M, "totalDistanceUnit"),
                 "calories": int(calories) if calories is not None else None,
+                "training_load": load,
+                "source": "apple",
+                "load_source": "estimated" if load is not None else None,
             }
         )
 

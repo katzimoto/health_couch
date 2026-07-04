@@ -21,7 +21,7 @@ from garmin_coach.database import Database
 from garmin_coach.migrations import add_meal_macro_columns
 
 _MACRO_COLUMNS = {"protein_g", "carbs_g", "fat_g", "fiber_g", "sugar_g"}
-_HEAD_REVISION = "0002"
+_HEAD_REVISION = "0003"
 
 
 def _make_legacy_db(path: str) -> None:
@@ -191,6 +191,40 @@ def test_pull_log_backfill_marks_preexisting_data_days(tmp_path) -> None:
             ((date.today() - timedelta(days=1)).isoformat(),),
         ).fetchone()[0]
     assert "assumed" not in status
+
+
+def test_workout_load_backfill_is_idempotent(tmp_path) -> None:
+    """0003: pre-existing workouts get source inferred and NULL loads
+    estimated — without touching Garmin-provided loads — and re-running the
+    revision changes nothing further."""
+    path = str(tmp_path / "loadfill.db")
+    db = Database(path=path)
+    # Simulate pre-upgrade rows: no source/load_source, mixed loads.
+    with db.engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO workout (activity_id, day, type, duration_s, training_load, updated_at) "
+            "VALUES (500, '2026-07-01', 'walking', 3600, NULL, '2026-07-01')"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO workout (activity_id, day, type, duration_s, training_load, updated_at) "
+            "VALUES (501, '2026-07-01', 'running', 1800, 71.0, '2026-07-01')"
+        )
+
+    def run_0003() -> None:
+        command.stamp(db._alembic_config(), "0002")
+        Database(path=path)  # boot re-upgrades to head
+
+    run_0003()
+    workouts = {w["activity_id"]: w for w in Database(path=path).recent_workouts(days=10_000)}
+    walk, run = workouts[500], workouts[501]
+    assert walk["training_load"] and walk["load_source"] == "estimated"
+    assert walk["source"] == "garmin"  # positive ID → garmin
+    assert run["training_load"] == 71.0 and run["load_source"] == "garmin"
+
+    first_pass = (walk["training_load"], run["training_load"])
+    run_0003()  # idempotent: second application changes nothing
+    workouts = {w["activity_id"]: w for w in Database(path=path).recent_workouts(days=10_000)}
+    assert (workouts[500]["training_load"], workouts[501]["training_load"]) == first_pass
 
 
 def test_schema_init_never_destroys_existing_data(tmp_path) -> None:
