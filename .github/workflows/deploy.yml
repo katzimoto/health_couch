@@ -27,6 +27,26 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
+      # Snapshot the database BEFORE anything about this version reaches the
+      # box, so any release (bad migration included) can be rolled back to the
+      # exact pre-deploy state. Uses SQLite's online backup API via the host's
+      # python3 — safe while the running (old) containers keep writing.
+      - name: Back up database before deploy
+        run: |
+          ssh -i ~/.ssh/deploy_key "$VPS_USER@$VPS_HOST" '
+            set -e
+            cd ~/health_couch
+            if [ -f data/health.db ]; then
+              mkdir -p data/backups
+              stamp=$(date +%Y%m%d-%H%M%S)
+              python3 -c "import sqlite3; src = sqlite3.connect(\"data/health.db\"); dst = sqlite3.connect(\"data/backups/pre-deploy-$stamp.db\"); src.backup(dst); dst.close(); src.close()"
+              echo "Saved data/backups/pre-deploy-$stamp.db"
+              ls -1t data/backups/pre-deploy-*.db | tail -n +8 | xargs -r rm --
+            else
+              echo "No database yet — nothing to back up."
+            fi
+          '
+
       - name: Sync tracked files to VPS
         run: |
           tar -cf - --exclude='.git' --exclude='.github' . | \

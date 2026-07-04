@@ -137,6 +137,35 @@ def test_mcp_log_meal_hummus_end_to_end(tmp_path, monkeypatch) -> None:
         importlib.reload(mcp_server)
 
 
+def test_schema_init_never_destroys_existing_data(tmp_path) -> None:
+    """Every deploy boots new code against the old database file — re-running
+    init_schema (create_all + column migration + view rebuild) must leave
+    every stored row byte-for-byte readable."""
+    path = str(tmp_path / "persist.db")
+    db = Database(path=path)
+    db.upsert_sleep("2026-07-01", score=80, total_seconds=7 * 3600)
+    db.upsert_weight("2026-07-01", weight_kg=79.0, body_fat=18.5)
+    db.upsert_workout(1, "2026-07-01", name="Run", type="running", training_load=50)
+    db.add_meal("dinner", day="2026-07-01", calories=600, protein_g=30.0)
+    db.add_vital("blood_glucose", 92.0, day="2026-07-01", unit="mg/dL")
+    db.add_message("user", "hi")
+    db.add_feedback("felt great", day="2026-07-01")
+    db.save_plan("2026-07-01", "plan text", details={"priorities": ["a", "b", "c"]})
+    db.record_pull("2026-07-01", {"sleep": "ok"})
+    before = db.daily_summary(days=10_000)
+
+    for _ in range(3):  # three "deploys"
+        db = Database(path=path)
+
+    assert db.daily_summary(days=10_000) == before
+    assert db.recent_meals(days=10_000)[0]["protein_g"] == 30.0
+    assert db.recent_vitals(days=10_000)[0]["value"] == 92.0
+    assert db.recent_messages() == [{"role": "user", "content": "hi"}]
+    assert db.recent_feedback(days=10_000)[0]["note"] == "felt great"
+    assert db.last_plan()["details"]["priorities"] == ["a", "b", "c"]
+    assert db.pulled_days("2026-07-01", "2026-07-01") == {"2026-07-01"}
+
+
 def test_meal_logging_with_and_without_macros(tmp_path) -> None:
     db = Database(path=str(tmp_path / "fresh.db"))
     db.add_meal(name="calorie only", day="2026-07-04", calories=500)
