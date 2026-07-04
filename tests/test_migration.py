@@ -13,9 +13,15 @@ import sqlite3
 
 import pytest
 
+from datetime import date, timedelta
+
+from alembic import command
+
 from garmin_coach.database import Database
+from garmin_coach.migrations import add_meal_macro_columns
 
 _MACRO_COLUMNS = {"protein_g", "carbs_g", "fat_g", "fiber_g", "sugar_g"}
+_HEAD_REVISION = "0002"
 
 
 def _make_legacy_db(path: str) -> None:
@@ -135,6 +141,56 @@ def test_mcp_log_meal_hummus_end_to_end(tmp_path, monkeypatch) -> None:
         importlib.reload(database)
         importlib.reload(analysis)
         importlib.reload(mcp_server)
+
+
+def _current_revision(db: Database) -> str | None:
+    with db.engine.connect() as conn:
+        row = conn.exec_driver_sql("SELECT version_num FROM alembic_version").fetchone()
+    return row[0] if row else None
+
+
+def test_alembic_upgrades_to_head_on_every_boot(tmp_path) -> None:
+    path = str(tmp_path / "versioned.db")
+    db = Database(path=path)
+    assert _current_revision(db) == _HEAD_REVISION
+    for _ in range(2):  # further boots are no-ops, not errors or re-runs
+        db = Database(path=path)
+    assert _current_revision(db) == _HEAD_REVISION
+
+
+def test_macro_migration_op_is_idempotent(legacy_path: str) -> None:
+    db = Database(path=legacy_path)  # boot already brings the table to head
+    with db.engine.begin() as conn:
+        add_meal_macro_columns(conn)  # racing sibling re-applies: harmless
+    columns = _meal_columns(legacy_path)
+    assert _MACRO_COLUMNS <= columns
+    assert len([c for c in columns if c in _MACRO_COLUMNS]) == len(_MACRO_COLUMNS)
+
+
+def test_pull_log_backfill_marks_preexisting_data_days(tmp_path) -> None:
+    path = str(tmp_path / "backfill.db")
+    db = Database(path=path)
+    for i in (1, 2, 3):
+        db.upsert_sleep(date.today() - timedelta(days=i), score=80)
+    db.upsert_sleep(date.today(), score=75)  # today must stay re-pullable
+    db.record_pull(date.today() - timedelta(days=1), {"sleep": "ok"})
+
+    # Data arrived after 0002 already ran on the fresh DB — stamp back to
+    # 0001 to simulate an upgraded database whose history predates pull_log.
+    command.stamp(db._alembic_config(), "0001")
+    db = Database(path=path)
+
+    start, end = date.today() - timedelta(days=3), date.today()
+    pulled = db.pulled_days(start, end)
+    assert {(date.today() - timedelta(days=i)).isoformat() for i in (1, 2, 3)} <= pulled
+    assert date.today().isoformat() not in pulled  # daily pull still owns today
+    # The genuine pull record beat the backfill's INSERT OR IGNORE.
+    with db.engine.connect() as conn:
+        status = conn.exec_driver_sql(
+            "SELECT status FROM pull_log WHERE day = ?",
+            ((date.today() - timedelta(days=1)).isoformat(),),
+        ).fetchone()[0]
+    assert "assumed" not in status
 
 
 def test_schema_init_never_destroys_existing_data(tmp_path) -> None:
