@@ -21,6 +21,7 @@ docker compose logs -f <service>            # scheduler | mcp | tunnel | telegra
 docker compose run --rm scheduler python scripts/garmin_login.py   # cache Garmin tokens (once, or after ~6mo expiry)
 docker compose run --rm scheduler python scripts/backfill.py 180   # backfill N days on demand
 docker compose run --rm telegram python scripts/get_chat_id.py     # find your Telegram chat id
+docker compose run --rm scheduler python scripts/import_apple_health.py /app/data/export.zip  # import an Apple Health export (idempotent; --since YYYY-MM-DD to limit)
 ```
 
 There is no lint/typecheck config in this repo — `pytest` is the only checked command.
