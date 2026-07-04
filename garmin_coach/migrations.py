@@ -88,6 +88,59 @@ def mark_existing_days_pulled(conn: Connection) -> None:
     )
 
 
+def backfill_workout_source_and_load(conn: Connection) -> None:
+    """Stamp provenance on pre-existing workouts and estimate missing loads.
+
+    Rows from before the source/load_source columns existed get their source
+    inferred (positive activity IDs are Garmin's, negative are synthetic
+    imports/manual logs), and workouts without a Garmin training load get the
+    documented heuristic estimate — otherwise weeks of real walking/lifting
+    read as zero load in the acute:chronic math. Guarded by WHERE ... IS NULL
+    throughout, so re-running (or racing a sibling container) is a no-op.
+    """
+    if not _table_exists(conn, "workout"):
+        return
+    columns = _existing_columns(conn, "workout")
+    if not {"source", "load_source", "duplicate_of"} <= columns:
+        return  # column reconciler hasn't run yet (never happens at startup)
+
+    conn.exec_driver_sql(
+        "UPDATE workout SET source = CASE WHEN activity_id > 0 "
+        "THEN 'garmin' ELSE 'manual' END WHERE source IS NULL"
+    )
+    conn.exec_driver_sql(
+        "UPDATE workout SET load_source = 'garmin' "
+        "WHERE training_load IS NOT NULL AND load_source IS NULL "
+        "AND source = 'garmin'"
+    )
+    rows = conn.exec_driver_sql(
+        "SELECT activity_id, type, duration_s, avg_hr FROM workout "
+        "WHERE training_load IS NULL AND duration_s IS NOT NULL"
+    ).fetchall()
+    from .training_load import estimate_training_load
+
+    for activity_id, wtype, duration_s, avg_hr in rows:
+        load = estimate_training_load(wtype, duration_s, avg_hr=avg_hr)
+        if load is not None:
+            conn.exec_driver_sql(
+                "UPDATE workout SET training_load = ?, load_source = 'estimated' "
+                "WHERE activity_id = ?",
+                (load, activity_id),
+            )
+
+
+def clear_estimated_workout_loads(conn: Connection) -> None:
+    """Downgrade: remove only the loads the forward migration estimated."""
+    if not _table_exists(conn, "workout"):
+        return
+    if "load_source" not in _existing_columns(conn, "workout"):
+        return
+    conn.exec_driver_sql(
+        "UPDATE workout SET training_load = NULL, load_source = NULL "
+        "WHERE load_source = 'estimated'"
+    )
+
+
 def unmark_assumed_pulled_days(conn: Connection) -> None:
     """Remove only the rows the forward migration created — genuine pull
     records carry a per-metric status, never the 'assumed' marker."""

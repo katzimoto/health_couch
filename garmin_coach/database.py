@@ -19,9 +19,11 @@ and idempotent.
 from __future__ import annotations
 
 import fcntl
+import itertools
 import json
 import logging
 import sqlite3
+import time as _time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
@@ -36,6 +38,7 @@ from .config import settings
 from .models import (
     SUMMARY_COLUMNS,
     BodyBattery,
+    BodyMeasurement,
     Conversation,
     Feedback,
     Hrv,
@@ -43,15 +46,21 @@ from .models import (
     Meal,
     Plan,
     PlanDetail,
+    Profile,
     PullLog,
+    Readiness,
     RestingHr,
     Sleep,
     Steps,
+    StrengthExercise,
+    StrengthSession,
     Stress,
+    TrainingPlan,
     Vital,
     Weight,
     Workout,
 )
+from .training_load import estimate_training_load
 
 log = logging.getLogger("garmin_coach.database")
 
@@ -75,8 +84,8 @@ SELECT
     w.weight_kg                              AS weight_kg,
     w.body_fat                               AS body_fat,
     hy.intake_ml                             AS hydration_ml,
-    (SELECT COUNT(*)  FROM workout wo WHERE wo.day = d.day)                       AS workout_count,
-    (SELECT COALESCE(SUM(training_load), 0) FROM workout wo WHERE wo.day = d.day) AS training_load,
+    (SELECT COUNT(*)  FROM workout wo WHERE wo.day = d.day AND wo.duplicate_of IS NULL)                       AS workout_count,
+    (SELECT COALESCE(SUM(training_load), 0) FROM workout wo WHERE wo.day = d.day AND wo.duplicate_of IS NULL) AS training_load,
     (SELECT COALESCE(SUM(calories), 0) FROM meal me WHERE me.day = d.day)         AS calories_in
 FROM (
     SELECT day FROM sleep
@@ -110,6 +119,16 @@ def _as_day(value: str | date | datetime) -> str:
     return str(value)[:10]
 
 
+# Synthetic (negative) activity IDs for workouts not synced from Garmin.
+# Time-based so they can never collide with Garmin's positive IDs across
+# restarts; the counter disambiguates calls in the same millisecond.
+_synthetic_seq = itertools.count()
+
+
+def synthetic_activity_id() -> int:
+    return -(int(_time.time() * 1000) * 1000 + next(_synthetic_seq) % 1000)
+
+
 class Database:
     """SQLModel-backed facade over the health database."""
 
@@ -127,8 +146,11 @@ class Database:
 
     def init_schema(self) -> None:
         SQLModel.metadata.create_all(self.engine)
-        self._upgrade_to_alembic_head()
+        # Column reconciliation runs BEFORE the Alembic upgrade so revisions
+        # can rely on model columns existing (e.g. 0003 backfills columns the
+        # reconciler just added).
         self._migrate_missing_columns()
+        self._upgrade_to_alembic_head()
         with self.engine.begin() as conn:
             conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
             try:
@@ -306,13 +328,18 @@ class Database:
             {"cutoff": self._cutoff(days)},
         )
 
-    def recent_workouts(self, days: int = 28) -> list[dict[str, Any]]:
+    def recent_workouts(
+        self, days: int = 28, include_duplicates: bool = False
+    ) -> list[dict[str, Any]]:
         with self.session() as s:
-            rows = s.exec(
+            stmt = (
                 select(Workout)
+                .where(Workout.day >= self._cutoff(days))
                 .order_by(Workout.day.desc(), Workout.activity_id.desc())
-                .limit(days * 3)
-            ).all()
+            )
+            if not include_duplicates:
+                stmt = stmt.where(Workout.duplicate_of == None)  # noqa: E711
+            rows = s.exec(stmt).all()
         return [r.model_dump() for r in rows]
 
     # ── Meals (user-logged, not pulled from Garmin) ─────────────────────────────
@@ -454,6 +481,551 @@ class Database:
                 .where(PullLog.day >= _as_day(start), PullLog.day <= _as_day(end))
             ).all()
         return set(rows)
+
+    # ── Profile / goals (single row, id=1) ─────────────────────────────────────
+
+    def get_profile(self) -> dict[str, Any] | None:
+        with self.session() as s:
+            row = s.get(Profile, 1)
+        return row.model_dump() if row else None
+
+    def set_profile(self, replace: bool = False, **fields: Any) -> dict[str, Any]:
+        """Update profile fields. Partial by default (None leaves a field
+        alone); ``replace=True`` rewrites the whole profile from ``fields``."""
+        with self.session() as s:
+            row = s.get(Profile, 1)
+            if row is None or replace:
+                if row is not None:
+                    s.delete(row)
+                    s.flush()
+                row = Profile(id=1, **{k: v for k, v in fields.items() if v is not None})
+            else:
+                for key, value in fields.items():
+                    if value is not None:
+                        setattr(row, key, value)
+                row.updated_at = datetime.now()
+            s.add(row)
+            s.commit()
+            s.refresh(row)
+            return row.model_dump()
+
+    # ── Strength sessions ──────────────────────────────────────────────────────
+
+    def _strength_rpe(self, exercises: list[dict[str, Any]]) -> float | None:
+        rpes = [e.get("rpe") for e in exercises if e.get("rpe") is not None]
+        return sum(rpes) / len(rpes) if rpes else None
+
+    def add_strength_session(
+        self,
+        day: str | date,
+        exercises: list[dict[str, Any]] | None = None,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        """Create a strength session plus its exercises, mirrored into a
+        Workout row (estimated training load) for history and load math."""
+        exercises = exercises or []
+        day_str = _as_day(day)
+        activity_id = synthetic_activity_id()
+        with self.session() as s:
+            session_row = StrengthSession(day=day_str, activity_id=activity_id, **fields)
+            s.add(session_row)
+            s.flush()
+            for ex in exercises:
+                s.add(StrengthExercise(session_id=session_row.id, **ex))
+            s.commit()
+            s.refresh(session_row)
+            session_id = session_row.id
+
+        load = estimate_training_load(
+            "strength_training",
+            fields.get("duration_s"),
+            avg_hr=fields.get("avg_hr"),
+            rpe=self._strength_rpe(exercises),
+        )
+        self.upsert_workout(
+            activity_id,
+            day_str,
+            name=fields.get("session_name") or "Strength session",
+            type="strength_training",
+            duration_s=fields.get("duration_s"),
+            calories=fields.get("calories"),
+            avg_hr=fields.get("avg_hr"),
+            max_hr=fields.get("max_hr"),
+            training_load=load,
+            source="manual",
+            load_source="estimated" if load is not None else None,
+        )
+        return self.get_strength_session(session_id)
+
+    def get_strength_session(self, session_id: int) -> dict[str, Any] | None:
+        with self.session() as s:
+            row = s.get(StrengthSession, session_id)
+            if row is None:
+                return None
+            exercises = s.exec(
+                select(StrengthExercise)
+                .where(StrengthExercise.session_id == session_id)
+                .order_by(StrengthExercise.id)
+            ).all()
+            out = row.model_dump()
+            out["exercises"] = [e.model_dump() for e in exercises]
+            return out
+
+    def recent_strength_sessions(self, days: int = 30) -> list[dict[str, Any]]:
+        with self.session() as s:
+            rows = s.exec(
+                select(StrengthSession)
+                .where(StrengthSession.day >= self._cutoff(days))
+                .order_by(StrengthSession.day, StrengthSession.id)
+            ).all()
+            ids = [r.id for r in rows]
+        return [self.get_strength_session(i) for i in ids]
+
+    def update_strength_session(
+        self,
+        session_id: int,
+        exercises: list[dict[str, Any]] | None = None,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        """Partial update; passing ``exercises`` replaces the exercise list."""
+        with self.session() as s:
+            row = s.get(StrengthSession, session_id)
+            if row is None:
+                return None
+            for key, value in fields.items():
+                if value is not None:
+                    setattr(row, key, value)
+            if exercises is not None:
+                for old in s.exec(
+                    select(StrengthExercise).where(StrengthExercise.session_id == session_id)
+                ).all():
+                    s.delete(old)
+                for ex in exercises:
+                    s.add(StrengthExercise(session_id=session_id, **ex))
+            s.add(row)
+            s.commit()
+            activity_id, day = row.activity_id, row.day
+
+        updated = self.get_strength_session(session_id)
+        if activity_id is not None:
+            load = estimate_training_load(
+                "strength_training",
+                updated.get("duration_s"),
+                avg_hr=updated.get("avg_hr"),
+                rpe=self._strength_rpe(updated["exercises"]),
+            )
+            self.upsert_workout(
+                activity_id,
+                day,
+                name=updated.get("session_name"),
+                duration_s=updated.get("duration_s"),
+                calories=updated.get("calories"),
+                avg_hr=updated.get("avg_hr"),
+                max_hr=updated.get("max_hr"),
+                training_load=load,
+                load_source="estimated" if load is not None else None,
+            )
+        return updated
+
+    def delete_strength_session(self, session_id: int) -> bool:
+        with self.session() as s:
+            row = s.get(StrengthSession, session_id)
+            if row is None:
+                return False
+            activity_id = row.activity_id
+            for ex in s.exec(
+                select(StrengthExercise).where(StrengthExercise.session_id == session_id)
+            ).all():
+                s.delete(ex)
+            s.delete(row)
+            if activity_id is not None:
+                workout = s.get(Workout, activity_id)
+                if workout is not None:
+                    s.delete(workout)
+            s.commit()
+        return True
+
+    def exercise_history(
+        self, exercise_name: str, days: int = 180, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Past occurrences of one exercise (newest first) with volume and
+        best-set info — the raw material for progressive-overload checks."""
+        with self.session() as s:
+            rows = s.exec(
+                select(StrengthExercise, StrengthSession)
+                .where(StrengthExercise.session_id == StrengthSession.id)
+                .where(StrengthSession.day >= self._cutoff(days))
+                .where(StrengthExercise.exercise_name.ilike(exercise_name))
+                .order_by(StrengthSession.day.desc(), StrengthExercise.id.desc())
+                .limit(limit)
+            ).all()
+        history = []
+        for exercise, session in rows:
+            volume = None
+            if exercise.sets and exercise.reps and exercise.weight_kg:
+                volume = round(exercise.sets * exercise.reps * exercise.weight_kg, 1)
+            history.append(
+                {
+                    "date": session.day,
+                    "session_id": session.id,
+                    "session_name": session.session_name,
+                    "sets": exercise.sets,
+                    "reps": exercise.reps,
+                    "weight_kg": exercise.weight_kg,
+                    "estimated_volume_kg": volume,
+                    "best_set_weight_kg": exercise.weight_kg,
+                    "rpe": exercise.rpe,
+                    "rir": exercise.rir,
+                    "completed": exercise.completed,
+                    "pain_note": exercise.pain_note,
+                }
+            )
+        return history
+
+    # ── Training plans (planned workouts + adherence) ──────────────────────────
+
+    def create_training_plan(self, day: str | date, **fields: Any) -> dict[str, Any]:
+        exercises = fields.pop("exercises", None)
+        if isinstance(exercises, (list, dict)):
+            exercises = json.dumps(exercises, ensure_ascii=False)
+        with self.session() as s:
+            row = TrainingPlan(day=_as_day(day), exercises=exercises, **fields)
+            s.add(row)
+            s.commit()
+            s.refresh(row)
+            return self._plan_dict(row)
+
+    @staticmethod
+    def _plan_dict(row: TrainingPlan) -> dict[str, Any]:
+        out = row.model_dump()
+        if out.get("exercises"):
+            try:
+                out["exercises"] = json.loads(out["exercises"])
+            except ValueError:
+                pass
+        return out
+
+    def get_training_plans(
+        self, days: int = 14, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self.session() as s:
+            stmt = (
+                select(TrainingPlan)
+                .where(TrainingPlan.day >= self._cutoff(days))
+                .order_by(TrainingPlan.day, TrainingPlan.id)
+            )
+            if status:
+                stmt = stmt.where(TrainingPlan.status == status)
+            rows = s.exec(stmt).all()
+        return [self._plan_dict(r) for r in rows]
+
+    def get_today_training_plans(self) -> list[dict[str, Any]]:
+        today = date.today().isoformat()
+        with self.session() as s:
+            rows = s.exec(
+                select(TrainingPlan)
+                .where(TrainingPlan.day == today)
+                .order_by(TrainingPlan.id)
+            ).all()
+        return [self._plan_dict(r) for r in rows]
+
+    def update_training_plan(self, plan_id: int, **fields: Any) -> dict[str, Any] | None:
+        with self.session() as s:
+            row = s.get(TrainingPlan, plan_id)
+            if row is None:
+                return None
+            for key, value in fields.items():
+                if value is not None:
+                    setattr(row, key, value)
+            s.add(row)
+            s.commit()
+            s.refresh(row)
+            return self._plan_dict(row)
+
+    # ── Meals: partial update / delete ─────────────────────────────────────────
+
+    def update_meal(self, meal_id: int, **fields: Any) -> str | None:
+        """Apply non-None fields; returns the meal's day, or None if missing."""
+        with self.session() as s:
+            row = s.get(Meal, meal_id)
+            if row is None:
+                return None
+            for key, value in fields.items():
+                if value is not None:
+                    setattr(row, key, value)
+            s.add(row)
+            s.commit()
+            return row.day
+
+    def delete_meal(self, meal_id: int) -> str | None:
+        with self.session() as s:
+            row = s.get(Meal, meal_id)
+            if row is None:
+                return None
+            day = row.day
+            s.delete(row)
+            s.commit()
+            return day
+
+    def meals_for_day(self, day: str | date) -> list[dict[str, Any]]:
+        with self.session() as s:
+            rows = s.exec(
+                select(Meal).where(Meal.day == _as_day(day)).order_by(Meal.id)
+            ).all()
+        return [r.model_dump() for r in rows]
+
+    # ── Workouts: partial update / delete ──────────────────────────────────────
+
+    def update_workout(self, activity_id: int, **fields: Any) -> dict[str, Any] | None:
+        with self.session() as s:
+            row = s.get(Workout, activity_id)
+            if row is None:
+                return None
+            for key, value in fields.items():
+                if value is not None:
+                    setattr(row, key, value)
+            s.add(row)
+            s.commit()
+            s.refresh(row)
+            return row.model_dump()
+
+    def delete_workout(self, activity_id: int) -> str | None:
+        with self.session() as s:
+            row = s.get(Workout, activity_id)
+            if row is None:
+                return None
+            day = row.day
+            s.delete(row)
+            s.commit()
+            return day
+
+    def workouts_for_day(self, day: str | date) -> list[dict[str, Any]]:
+        with self.session() as s:
+            rows = s.exec(
+                select(Workout)
+                .where(Workout.day == _as_day(day))
+                .where(Workout.duplicate_of == None)  # noqa: E711
+                .order_by(Workout.activity_id)
+            ).all()
+        return [r.model_dump() for r in rows]
+
+    # ── Nutrition summary ──────────────────────────────────────────────────────
+
+    def nutrition_summary(
+        self, days: int = 7, day: str | date | None = None
+    ) -> list[dict[str, Any]]:
+        """Per-day nutrition totals vs. profile targets, newest day first.
+        Meals missing macros simply contribute nothing to those totals."""
+        if day is not None:
+            day_list = [_as_day(day)]
+            with self.session() as s:
+                meal_rows = s.exec(select(Meal).where(Meal.day == day_list[0])).all()
+        else:
+            cutoff = self._cutoff(days)
+            with self.session() as s:
+                meal_rows = s.exec(
+                    select(Meal).where(Meal.day >= cutoff).order_by(Meal.day, Meal.id)
+                ).all()
+            day_list = sorted({m.day for m in meal_rows}, reverse=True)
+
+        profile = self.get_profile() or {}
+        calorie_target = profile.get("calorie_target")
+        protein_target = profile.get("protein_target_g")
+
+        by_day: dict[str, list[Meal]] = {}
+        for meal in meal_rows:
+            by_day.setdefault(meal.day, []).append(meal)
+
+        def total(meals: list[Meal], field: str) -> float | None:
+            values = [getattr(m, field) for m in meals if getattr(m, field) is not None]
+            return round(sum(values), 1) if values else None
+
+        out = []
+        for d in day_list:
+            meals = by_day.get(d, [])
+            calories = total(meals, "calories")
+            protein = total(meals, "protein_g")
+            out.append(
+                {
+                    "day": d,
+                    "total_calories": calories,
+                    "total_protein_g": protein,
+                    "total_carbs_g": total(meals, "carbs_g"),
+                    "total_fat_g": total(meals, "fat_g"),
+                    "total_fiber_g": total(meals, "fiber_g"),
+                    "total_sugar_g": total(meals, "sugar_g"),
+                    "meal_count": len(meals),
+                    "calorie_target": calorie_target,
+                    "protein_target_g": protein_target,
+                    "calories_remaining": (
+                        round(calorie_target - (calories or 0), 1)
+                        if calorie_target is not None else None
+                    ),
+                    "protein_remaining_g": (
+                        round(protein_target - (protein or 0), 1)
+                        if protein_target is not None else None
+                    ),
+                    "meals": [m.model_dump() for m in meals],
+                }
+            )
+        return out
+
+    # ── Readiness ──────────────────────────────────────────────────────────────
+
+    def upsert_readiness(self, day: str | date, **f: Any) -> None:
+        self._upsert(Readiness(day=_as_day(day), **f))
+
+    def recent_readiness(self, days: int = 14) -> list[dict[str, Any]]:
+        with self.session() as s:
+            rows = s.exec(
+                select(Readiness)
+                .where(Readiness.day >= self._cutoff(days))
+                .order_by(Readiness.day)
+            ).all()
+        return [r.model_dump() for r in rows]
+
+    def latest_readiness(self) -> dict[str, Any] | None:
+        with self.session() as s:
+            row = s.exec(
+                select(Readiness).order_by(Readiness.day.desc()).limit(1)
+            ).first()
+        return row.model_dump() if row else None
+
+    # ── Body measurements ──────────────────────────────────────────────────────
+
+    def upsert_body_measurement(self, day: str | date, **f: Any) -> None:
+        self._upsert(BodyMeasurement(day=_as_day(day), **f))
+
+    def recent_body_measurements(self, days: int = 90) -> list[dict[str, Any]]:
+        with self.session() as s:
+            rows = s.exec(
+                select(BodyMeasurement)
+                .where(BodyMeasurement.day >= self._cutoff(days))
+                .order_by(BodyMeasurement.day)
+            ).all()
+        return [r.model_dump() for r in rows]
+
+    # ── Hydration reads ────────────────────────────────────────────────────────
+
+    def recent_hydration(self, days: int = 14) -> list[dict[str, Any]]:
+        with self.session() as s:
+            rows = s.exec(
+                select(Hydration)
+                .where(Hydration.day >= self._cutoff(days))
+                .order_by(Hydration.day)
+            ).all()
+        out = []
+        for r in rows:
+            pct = None
+            if r.intake_ml is not None and r.goal_ml:
+                pct = round(100.0 * r.intake_ml / r.goal_ml, 1)
+            entry = r.model_dump()
+            entry["percent_of_goal"] = pct
+            out.append(entry)
+        return out
+
+    # ── Workout deduplication ──────────────────────────────────────────────────
+
+    _DEFAULT_SOURCE_PRIORITY = ("garmin", "apple", "manual")
+
+    def _source_priority(self) -> list[str]:
+        profile = self.get_profile() or {}
+        raw = profile.get("activity_source_priority") or ""
+        order = [p.strip() for p in raw.split(",") if p.strip()]
+        return order or list(self._DEFAULT_SOURCE_PRIORITY)
+
+    @staticmethod
+    def _workout_source(w: dict[str, Any]) -> str:
+        if w.get("source"):
+            return w["source"]
+        return "garmin" if w["activity_id"] > 0 else "manual"
+
+    @staticmethod
+    def _close(a: float | None, b: float | None, tolerance: float) -> bool | None:
+        """True/False when both present, None when incomparable."""
+        if a is None or b is None:
+            return None
+        biggest = max(abs(a), abs(b))
+        if biggest == 0:
+            return True
+        return abs(a - b) / biggest <= tolerance
+
+    @classmethod
+    def _looks_duplicate(cls, a: dict[str, Any], b: dict[str, Any]) -> bool:
+        """Same-day activities that look like one physical workout recorded
+        twice (Garmin + Apple/manual import). Requires comparable duration,
+        and rejects on any clearly-different measurable."""
+        duration = cls._close(a.get("duration_s"), b.get("duration_s"), 0.15)
+        if duration is not True:
+            return False
+        distance = cls._close(a.get("distance_m"), b.get("distance_m"), 0.15)
+        if distance is False:
+            return False
+        calories = cls._close(
+            float(a["calories"]) if a.get("calories") is not None else None,
+            float(b["calories"]) if b.get("calories") is not None else None,
+            0.25,
+        )
+        if calories is False:
+            return False
+        return True
+
+    def find_duplicate_workouts(self, days: int = 60) -> list[list[dict[str, Any]]]:
+        """Groups of same-day activities that look like one workout recorded
+        by multiple sources. Detection only — nothing is modified."""
+        workouts = self.recent_workouts(days=days, include_duplicates=False)
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for w in workouts:
+            by_day.setdefault(w["day"], []).append(w)
+
+        groups: list[list[dict[str, Any]]] = []
+        for day_workouts in by_day.values():
+            remaining = list(day_workouts)
+            while remaining:
+                seed = remaining.pop(0)
+                group = [seed]
+                still = []
+                for other in remaining:
+                    if self._looks_duplicate(seed, other):
+                        group.append(other)
+                    else:
+                        still.append(other)
+                remaining = still
+                if len(group) > 1:
+                    groups.append(group)
+        return groups
+
+    def dedupe_workouts(self, days: int = 60) -> dict[str, Any]:
+        """Mark duplicates (soft delete): in each detected group the workout
+        from the highest-priority source is kept, the rest get
+        ``duplicate_of = <kept activity_id>``. Reversible via update_workout."""
+        priority = self._source_priority()
+
+        def rank(w: dict[str, Any]) -> tuple:
+            source = self._workout_source(w)
+            idx = priority.index(source) if source in priority else len(priority)
+            has_real_load = 0 if w.get("load_source") == "garmin" else 1
+            return (idx, has_real_load, -w["activity_id"])
+
+        groups = self.find_duplicate_workouts(days=days)
+        marked = []
+        with self.session() as s:
+            for group in groups:
+                keeper, *dupes = sorted(group, key=rank)
+                for dupe in dupes:
+                    row = s.get(Workout, dupe["activity_id"])
+                    row.duplicate_of = keeper["activity_id"]
+                    s.add(row)
+                    marked.append(
+                        {
+                            "marked_duplicate": dupe["activity_id"],
+                            "kept": keeper["activity_id"],
+                            "day": dupe["day"],
+                            "name": dupe.get("name"),
+                        }
+                    )
+            s.commit()
+        return {"groups_found": len(groups), "marked": marked, "priority": priority}
 
     # ── Backup ─────────────────────────────────────────────────────────────────
 

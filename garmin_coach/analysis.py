@@ -190,4 +190,7 @@ class Analyzer:
             "sleep_debt_7d": self.sleep_debt(rows),
             "training_load": self.acute_chronic_ratio(),
             "flags": self.flags(rows),
+            # Subjective check-in, when the user has logged one — lets the
+            # coach weigh how they feel against what the sensors say.
+            "readiness": self.db.latest_readiness(),
         }

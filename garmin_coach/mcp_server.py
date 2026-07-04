@@ -23,9 +23,7 @@ public URL; ChatGPT discovers the OAuth flow automatically.
 
 from __future__ import annotations
 
-import itertools
 import logging
-import time
 from datetime import date
 
 from fastmcp import FastMCP
@@ -34,7 +32,8 @@ from fastmcp.server.auth.providers.workos import AuthKitProvider
 
 from .analysis import Analyzer
 from .config import settings
-from .database import Database
+from .database import Database, synthetic_activity_id as _synthetic_activity_id
+from .training_load import estimate_training_load
 
 log = logging.getLogger("garmin_coach.mcp")
 
@@ -69,15 +68,6 @@ def _build_server() -> FastMCP:
 
 mcp = _build_server()
 
-# Synthetic (negative) activity IDs for manually logged workouts. Time-based so
-# they can never collide with Garmin's positive IDs across restarts; the
-# counter disambiguates calls that land in the same millisecond.
-_synthetic_seq = itertools.count()
-
-
-def _synthetic_activity_id() -> int:
-    return -(int(time.time() * 1000) * 1000 + next(_synthetic_seq) % 1000)
-
 
 @mcp.tool
 def get_daily_summary(days: int = 14) -> list[dict]:
@@ -102,7 +92,9 @@ def get_sleep_trend(days: int = 30) -> dict:
 @mcp.tool
 def get_training_load(days: int = 28) -> dict:
     """EWMA-weighted acute (7d) vs chronic (28d) training load, their ratio,
-    and recent workouts. Ratio >1.5 = spike, <0.8 = detraining."""
+    and recent workouts (duplicates excluded). Ratio >1.5 = spike, <0.8 =
+    detraining. Each workout's ``load_source`` says whether its load is
+    garmin-provided, estimated (documented heuristic), or manually entered."""
     return {
         "acute_chronic": analyzer.acute_chronic_ratio(),
         "recent_workouts": db.recent_workouts(days=days),
@@ -225,12 +217,19 @@ def log_workout(
     calories: int | None = None,
     avg_hr: int | None = None,
     max_hr: int | None = None,
+    training_load: float | None = None,
 ) -> dict:
     """Log a workout not synced from Garmin (e.g. from Apple Health or a
     manual description). ``day`` defaults to today. Assigned a synthetic
-    negative activity ID so it never collides with a real Garmin activity."""
+    negative activity ID so it never collides with a real Garmin activity.
+    Pass ``training_load`` to override; otherwise it's estimated from
+    type/duration/HR so load analysis doesn't read the workout as rest."""
     target_day = day or date.today().isoformat()
     activity_id = _synthetic_activity_id()
+    load_source = "manual" if training_load is not None else None
+    if training_load is None:
+        training_load = estimate_training_load(type, duration_s, avg_hr=avg_hr)
+        load_source = "estimated" if training_load is not None else None
     db.upsert_workout(
         activity_id,
         target_day,
@@ -241,8 +240,17 @@ def log_workout(
         calories=calories,
         avg_hr=avg_hr,
         max_hr=max_hr,
+        training_load=training_load,
+        source="manual",
+        load_source=load_source,
     )
-    return {"logged": True, "day": target_day, "activity_id": activity_id}
+    return {
+        "logged": True,
+        "day": target_day,
+        "activity_id": activity_id,
+        "training_load": training_load,
+        "load_source": load_source,
+    }
 
 
 @mcp.tool
@@ -306,6 +314,9 @@ def log_apple_health_export(records: list[dict]) -> dict:
                     note=rec.get("note"),
                 )
             elif kind == "workout":
+                est = estimate_training_load(
+                    rec.get("type"), rec.get("duration_s"), avg_hr=rec.get("avg_hr")
+                )
                 db.upsert_workout(
                     _synthetic_activity_id(),
                     day,
@@ -316,6 +327,9 @@ def log_apple_health_export(records: list[dict]) -> dict:
                     calories=rec.get("calories"),
                     avg_hr=rec.get("avg_hr"),
                     max_hr=rec.get("max_hr"),
+                    training_load=est,
+                    source="apple",
+                    load_source="estimated" if est is not None else None,
                 )
             elif kind == "hydration":
                 db.upsert_hydration(day, intake_ml=rec["intake_ml"], goal_ml=rec.get("goal_ml"))
@@ -339,6 +353,432 @@ def log_apple_health_export(records: list[dict]) -> dict:
         "ok": ok_count,
         "failed": len(records) - ok_count,
         "results": results,
+    }
+
+
+# ── Profile / goals ─────────────────────────────────────────────────────────────
+
+@mcp.tool
+def get_profile() -> dict | None:
+    """The user's profile and goals (age, sex, height, target weight, goal
+    type, training level, injuries, equipment, food restrictions, calorie/
+    macro targets). Read this before recommending training or food. Returns
+    null if no profile has been set yet."""
+    return db.get_profile()
+
+
+@mcp.tool
+def set_profile(
+    age: int | None = None,
+    sex: str | None = None,
+    height_cm: float | None = None,
+    current_weight_kg: float | None = None,
+    target_weight_kg: float | None = None,
+    goal_type: str | None = None,
+    training_level: str | None = None,
+    injuries_or_limitations: str | None = None,
+    available_equipment: str | None = None,
+    preferred_training_days: str | None = None,
+    food_restrictions: str | None = None,
+    calorie_target: int | None = None,
+    protein_target_g: float | None = None,
+    carbs_target_g: float | None = None,
+    fat_target_g: float | None = None,
+    fiber_target_g: float | None = None,
+    notes: str | None = None,
+    replace: bool = False,
+) -> dict:
+    """Create or update the user profile. Partial by default — only the
+    fields you pass change. Set ``replace=True`` only when the user
+    explicitly wants the whole profile rewritten. goal_type: fat_loss |
+    muscle_gain | recomposition | endurance | general_health; training_level:
+    beginner | intermediate | advanced."""
+    return db.set_profile(
+        replace=replace,
+        age=age, sex=sex, height_cm=height_cm,
+        current_weight_kg=current_weight_kg, target_weight_kg=target_weight_kg,
+        goal_type=goal_type, training_level=training_level,
+        injuries_or_limitations=injuries_or_limitations,
+        available_equipment=available_equipment,
+        preferred_training_days=preferred_training_days,
+        food_restrictions=food_restrictions, calorie_target=calorie_target,
+        protein_target_g=protein_target_g, carbs_target_g=carbs_target_g,
+        fat_target_g=fat_target_g, fiber_target_g=fiber_target_g, notes=notes,
+    )
+
+
+# ── Strength training ───────────────────────────────────────────────────────────
+
+@mcp.tool
+def log_strength_session(
+    exercises: list[dict],
+    day: str | None = None,
+    session_name: str | None = None,
+    duration_s: float | None = None,
+    calories: int | None = None,
+    avg_hr: int | None = None,
+    max_hr: int | None = None,
+    notes: str | None = None,
+) -> dict:
+    """Log a detailed strength workout. Each exercise dict may carry:
+    exercise_name (required), sets, reps, weight_kg, rpe, rir, rest_s,
+    completed, pain_note, notes — all except the name optional. The session
+    is mirrored into workout history with an estimated training load, so it
+    counts toward acute:chronic load. Returns the stored session with its
+    ``id`` (for updates) and exercise rows."""
+    return db.add_strength_session(
+        day or date.today().isoformat(),
+        exercises=exercises,
+        session_name=session_name,
+        duration_s=duration_s,
+        calories=calories,
+        avg_hr=avg_hr,
+        max_hr=max_hr,
+        notes=notes,
+    )
+
+
+@mcp.tool
+def get_strength_sessions(days: int = 30) -> list[dict]:
+    """Strength sessions (with exercises) over the last ``days``, oldest
+    first."""
+    return db.recent_strength_sessions(days=max(1, min(days, 365)))
+
+
+@mcp.tool
+def get_exercise_history(exercise_name: str, days: int = 180, limit: int = 20) -> list[dict]:
+    """Past performances of one exercise, newest first: date, sets, reps,
+    weight, estimated volume, best set, RPE/RIR. Use to check progressive
+    overload and pick today's working weight."""
+    return db.exercise_history(exercise_name, days=max(1, min(days, 730)), limit=limit)
+
+
+@mcp.tool
+def update_strength_session(
+    session_id: int,
+    exercises: list[dict] | None = None,
+    session_name: str | None = None,
+    duration_s: float | None = None,
+    calories: int | None = None,
+    avg_hr: int | None = None,
+    max_hr: int | None = None,
+    notes: str | None = None,
+) -> dict:
+    """Correct a strength session. Only provided fields change; passing
+    ``exercises`` replaces the whole exercise list. The mirrored workout row
+    and its estimated load are refreshed."""
+    updated = db.update_strength_session(
+        session_id, exercises=exercises, session_name=session_name,
+        duration_s=duration_s, calories=calories, avg_hr=avg_hr,
+        max_hr=max_hr, notes=notes,
+    )
+    return updated or {"error": f"no strength session with id {session_id}"}
+
+
+@mcp.tool
+def delete_strength_session(session_id: int) -> dict:
+    """Delete a strength session, its exercises, and its mirrored workout
+    row (daily summaries recompute automatically)."""
+    deleted = db.delete_strength_session(session_id)
+    return {"deleted": deleted, "session_id": session_id}
+
+
+# ── Planned workouts and adherence ──────────────────────────────────────────────
+
+@mcp.tool
+def create_training_plan(
+    day: str,
+    title: str,
+    goal: str | None = None,
+    planned_start_time: str | None = None,
+    estimated_duration_s: float | None = None,
+    workout_type: str | None = None,
+    exercises: list[dict] | None = None,
+    cardio_plan: str | None = None,
+    intensity_target: str | None = None,
+    notes: str | None = None,
+) -> dict:
+    """Plan a workout for a specific date (YYYY-MM-DD). Later mark it via
+    mark_plan_done / mark_plan_skipped so adherence can shape future
+    recommendations. Returns the plan with its ``id``."""
+    return db.create_training_plan(
+        day, title=title, goal=goal, planned_start_time=planned_start_time,
+        estimated_duration_s=estimated_duration_s, workout_type=workout_type,
+        exercises=exercises, cardio_plan=cardio_plan,
+        intensity_target=intensity_target, notes=notes,
+    )
+
+
+@mcp.tool
+def get_today_plan() -> list[dict]:
+    """Today's planned workout(s) with status (planned / done / skipped /
+    partially_done). Empty list if nothing is planned."""
+    return db.get_today_training_plans()
+
+
+@mcp.tool
+def get_training_plans(days: int = 14, status: str | None = None) -> list[dict]:
+    """Training plans over the last ``days`` (oldest first), optionally
+    filtered by status — e.g. status='skipped' to see what keeps not
+    happening."""
+    return db.get_training_plans(days=max(1, min(days, 365)), status=status)
+
+
+@mcp.tool
+def mark_plan_done(
+    plan_id: int,
+    actual_duration_s: float | None = None,
+    difficulty_rpe: float | None = None,
+    notes: str | None = None,
+    partially: bool = False,
+) -> dict:
+    """Mark a training plan completed (or ``partially=True`` for a partial
+    session). Record actual duration and how hard it felt (RPE 1-10)."""
+    updated = db.update_training_plan(
+        plan_id,
+        status="partially_done" if partially else "done",
+        actual_duration_s=actual_duration_s,
+        difficulty_rpe=difficulty_rpe,
+        feedback=notes,
+    )
+    return updated or {"error": f"no training plan with id {plan_id}"}
+
+
+@mcp.tool
+def mark_plan_skipped(plan_id: int, reason: str | None = None) -> dict:
+    """Mark a training plan skipped, with the reason (tired, sick, no time…)
+    — the reason matters for tomorrow's recommendation."""
+    updated = db.update_training_plan(plan_id, status="skipped", skip_reason=reason)
+    return updated or {"error": f"no training plan with id {plan_id}"}
+
+
+@mcp.tool
+def log_plan_feedback(plan_id: int, feedback: str) -> dict:
+    """Attach free-text feedback to a training plan (how it went, what to
+    change next time)."""
+    updated = db.update_training_plan(plan_id, feedback=feedback)
+    return updated or {"error": f"no training plan with id {plan_id}"}
+
+
+# ── Nutrition summary ───────────────────────────────────────────────────────────
+
+@mcp.tool
+def get_nutrition_summary(days: int = 7, day: str | None = None) -> list[dict]:
+    """Per-day nutrition totals (calories + macros), meal count, the meals
+    themselves, and — when a profile sets targets — calories/protein
+    remaining. Pass ``day`` for a single date. Use for 'what should I eat
+    next today?'. Meals logged without macros contribute only what they
+    carry."""
+    return db.nutrition_summary(days=max(1, min(days, 90)), day=day)
+
+
+# ── Meal / workout corrections ──────────────────────────────────────────────────
+
+@mcp.tool
+def update_meal(
+    meal_id: int,
+    name: str | None = None,
+    calories: int | None = None,
+    protein_g: float | None = None,
+    carbs_g: float | None = None,
+    fat_g: float | None = None,
+    fiber_g: float | None = None,
+    sugar_g: float | None = None,
+    note: str | None = None,
+) -> dict:
+    """Correct a logged meal (estimates are often wrong). Only provided
+    fields change. ``meal_id`` comes from get_meals. Returns that day's
+    meals after the update."""
+    day = db.update_meal(
+        meal_id, name=name, calories=calories, protein_g=protein_g,
+        carbs_g=carbs_g, fat_g=fat_g, fiber_g=fiber_g, sugar_g=sugar_g,
+        note=note,
+    )
+    if day is None:
+        return {"error": f"no meal with id {meal_id}"}
+    return {"updated": True, "day": day, "meals": db.meals_for_day(day)}
+
+
+@mcp.tool
+def delete_meal(meal_id: int) -> dict:
+    """Delete a logged meal. Returns the day's remaining meals."""
+    day = db.delete_meal(meal_id)
+    if day is None:
+        return {"error": f"no meal with id {meal_id}"}
+    return {"deleted": True, "day": day, "meals": db.meals_for_day(day)}
+
+
+@mcp.tool
+def update_workout(
+    activity_id: int,
+    name: str | None = None,
+    type: str | None = None,
+    duration_s: float | None = None,
+    distance_m: float | None = None,
+    calories: int | None = None,
+    avg_hr: int | None = None,
+    max_hr: int | None = None,
+    training_load: float | None = None,
+) -> dict:
+    """Correct a workout. Only provided fields change. Setting
+    ``training_load`` marks it manually entered."""
+    fields: dict = dict(
+        name=name, type=type, duration_s=duration_s, distance_m=distance_m,
+        calories=calories, avg_hr=avg_hr, max_hr=max_hr,
+        training_load=training_load,
+    )
+    if training_load is not None:
+        fields["load_source"] = "manual"
+    updated = db.update_workout(activity_id, **fields)
+    if updated is None:
+        return {"error": f"no workout with activity_id {activity_id}"}
+    return {"updated": True, "day": updated["day"], "workouts": db.workouts_for_day(updated["day"])}
+
+
+@mcp.tool
+def delete_workout(activity_id: int) -> dict:
+    """Delete a workout (e.g. a wrong or duplicated entry). Returns the
+    day's remaining workouts; daily summaries recompute automatically."""
+    day = db.delete_workout(activity_id)
+    if day is None:
+        return {"error": f"no workout with activity_id {activity_id}"}
+    return {"deleted": True, "day": day, "workouts": db.workouts_for_day(day)}
+
+
+# ── Workout deduplication ───────────────────────────────────────────────────────
+
+@mcp.tool
+def get_duplicate_workouts(days: int = 60) -> list[list[dict]]:
+    """Groups of same-day activities that look like one workout recorded by
+    multiple sources (similar duration/distance/calories). Detection only —
+    review before calling dedupe_workouts."""
+    return db.find_duplicate_workouts(days=max(1, min(days, 365)))
+
+
+@mcp.tool
+def dedupe_workouts(days: int = 60) -> dict:
+    """Soft-delete duplicates: in each group the highest-priority source
+    (default garmin > apple > manual; see set_activity_source_priority) is
+    kept and the rest are marked ``duplicate_of`` the keeper. Marked rows
+    disappear from summaries and training load but stay in the database
+    (no hard delete). Returns what was marked."""
+    return db.dedupe_workouts(days=max(1, min(days, 365)))
+
+
+@mcp.tool
+def set_activity_source_priority(priority: list[str]) -> dict:
+    """Which source wins when the same workout exists twice, highest first —
+    e.g. ["garmin", "apple", "manual"]."""
+    profile = db.set_profile(activity_source_priority=",".join(priority))
+    return {"activity_source_priority": profile["activity_source_priority"]}
+
+
+# ── Readiness check-in ──────────────────────────────────────────────────────────
+
+@mcp.tool
+def log_readiness(
+    day: str | None = None,
+    energy_1_10: int | None = None,
+    soreness_1_10: int | None = None,
+    motivation_1_10: int | None = None,
+    sleep_quality_1_10: int | None = None,
+    stress_1_10: int | None = None,
+    mood: str | None = None,
+    pain_areas: str | None = None,
+    notes: str | None = None,
+) -> dict:
+    """Log the subjective daily check-in (1-10 scales). One entry per day —
+    re-logging updates the provided fields. Combine with HRV/sleep/load when
+    deciding how hard today should be."""
+    target_day = day or date.today().isoformat()
+    db.upsert_readiness(
+        target_day, energy_1_10=energy_1_10, soreness_1_10=soreness_1_10,
+        motivation_1_10=motivation_1_10, sleep_quality_1_10=sleep_quality_1_10,
+        stress_1_10=stress_1_10, mood=mood, pain_areas=pain_areas, notes=notes,
+    )
+    return {"logged": True, "day": target_day}
+
+
+@mcp.tool
+def get_readiness(days: int = 14) -> list[dict]:
+    """Readiness check-ins over the last ``days``, oldest first."""
+    return db.recent_readiness(days=max(1, min(days, 365)))
+
+
+# ── Body measurements ───────────────────────────────────────────────────────────
+
+@mcp.tool
+def log_body_measurements(
+    day: str | None = None,
+    waist_cm: float | None = None,
+    chest_cm: float | None = None,
+    neck_cm: float | None = None,
+    arm_cm: float | None = None,
+    thigh_cm: float | None = None,
+    hip_cm: float | None = None,
+    notes: str | None = None,
+) -> dict:
+    """Log tape measurements (any subset). One entry per day — re-logging
+    updates the provided fields. Tracks recomposition better than weight."""
+    target_day = day or date.today().isoformat()
+    db.upsert_body_measurement(
+        target_day, waist_cm=waist_cm, chest_cm=chest_cm, neck_cm=neck_cm,
+        arm_cm=arm_cm, thigh_cm=thigh_cm, hip_cm=hip_cm, notes=notes,
+    )
+    return {"logged": True, "day": target_day}
+
+
+@mcp.tool
+def get_body_measurement_trend(days: int = 90) -> dict:
+    """Measurement series over ``days`` plus latest-vs-previous deltas per
+    site (waist, chest, neck, arm, thigh, hip)."""
+    rows = db.recent_body_measurements(days=max(1, min(days, 730)))
+    deltas: dict = {}
+    for field in ("waist_cm", "chest_cm", "neck_cm", "arm_cm", "thigh_cm", "hip_cm"):
+        series = [(r["day"], r[field]) for r in rows if r[field] is not None]
+        if not series:
+            continue
+        latest_day, latest = series[-1]
+        previous = series[-2][1] if len(series) > 1 else None
+        deltas[field] = {
+            "latest": latest,
+            "latest_day": latest_day,
+            "previous": previous,
+            "delta": round(latest - previous, 1) if previous is not None else None,
+        }
+    return {"series": rows, "deltas": deltas}
+
+
+# ── Hydration reads ─────────────────────────────────────────────────────────────
+
+@mcp.tool
+def get_hydration(days: int = 14) -> list[dict]:
+    """Daily hydration entries (intake, goal, percent of goal) over the last
+    ``days``, oldest first. Days never logged are absent."""
+    return db.recent_hydration(days=max(1, min(days, 365)))
+
+
+@mcp.tool
+def get_hydration_trend(days: int = 7) -> dict:
+    """Hydration over the last ``days``: 7d-style average intake, average
+    percent of goal, and which days have no entry at all."""
+    days = max(1, min(days, 90))
+    rows = db.recent_hydration(days=days)
+    from datetime import timedelta
+
+    logged = {r["day"]: r for r in rows}
+    window = [
+        (date.today() - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)
+    ]
+    intakes = [r["intake_ml"] for r in rows if r["intake_ml"] is not None]
+    pcts = [r["percent_of_goal"] for r in rows if r["percent_of_goal"] is not None]
+    return {
+        "days": days,
+        "average_intake_ml": round(sum(intakes) / len(intakes)) if intakes else None,
+        "average_percent_of_goal": round(sum(pcts) / len(pcts), 1) if pcts else None,
+        "days_logged": len(rows),
+        "missed_days": [d for d in window if d not in logged],
+        "entries": rows,
     }
 
 
