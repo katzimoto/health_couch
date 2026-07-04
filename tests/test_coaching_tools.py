@@ -123,6 +123,155 @@ def test_strength_session_update_and_delete(db: Database) -> None:
     assert db.latest_summary() is None or db.latest_summary().get("workout_count") in (0, None)
 
 
+# ── Exercise-level logging: per-set data, planned vs actual, substitutions ─────
+
+_LEG_PRESS_SETS = [
+    {"reps": 10, "weight_kg": 80, "rpe": 7},
+    {"reps": 9, "weight_kg": 80, "rpe": 7.5},
+    {"reps": 8, "weight_kg": 80, "rpe": 8},
+]
+
+
+def test_per_set_logging_derives_aggregates_and_roundtrips(db: Database) -> None:
+    session = db.add_strength_session(
+        _day(),
+        gym="Sports Center",
+        session_name="Full Body Hypertrophy Restart",
+        exercises=[{
+            "exercise_name": "Leg Press",
+            "machine": "45° sled",
+            "planned_sets": 3,
+            "planned_reps": "8-10",
+            "planned_weight_kg": 80,
+            "actual_sets": _LEG_PRESS_SETS,
+            "status": "completed",
+            "notes": "Good form, keep same weight next time",
+        }],
+    )
+    assert session["gym"] == "Sports Center"
+    ex = session["exercises"][0]
+    assert ex["actual_sets"] == _LEG_PRESS_SETS  # per-set data preserved
+    assert ex["sets"] == 3  # aggregates derived from the sets
+    assert ex["reps"] == 9
+    assert ex["weight_kg"] == 80
+    assert ex["rpe"] == 7.5
+    assert ex["planned_reps"] == "8-10"
+
+    history = db.exercise_history("leg press")[0]
+    assert history["estimated_volume_kg"] == (10 + 9 + 8) * 80
+    assert history["best_set_weight_kg"] == 80
+    assert history["machine"] == "45° sled"
+    assert history["gym"] == "Sports Center"
+
+
+def test_skipped_and_substituted_exercises_visible(db: Database) -> None:
+    session = db.add_strength_session(
+        _day(),
+        exercises=[
+            {"exercise_name": "Bench press", "status": "substituted",
+             "substitute_exercise": "Dumbbell bench press",
+             "notes": "bench was busy"},
+            {"exercise_name": "Lat pulldown", "completed": False},  # → skipped
+            {"exercise_name": "Leg press", "sets": 3, "reps": 10, "weight_kg": 80},
+        ],
+    )
+    statuses = {e["exercise_name"]: e["status"] for e in session["exercises"]}
+    assert statuses["Bench press"] == "substituted"
+    assert statuses["Lat pulldown"] == "skipped"  # derived from completed=False
+    assert session["exercises"][0]["substitute_exercise"] == "Dumbbell bench press"
+
+
+# ── Next-session weight recommendations ─────────────────────────────────────────
+
+def test_recommendation_progresses_when_rpe_low(db: Database) -> None:
+    db.add_strength_session(
+        _day(3),
+        exercises=[{"exercise_name": "Leg Press", "actual_sets": _LEG_PRESS_SETS}],
+    )
+    from garmin_coach.progression import recommend_next_weight
+
+    rec = recommend_next_weight(db.exercise_history("Leg Press")[0])
+    # Aggregate RPE 7.5 → in the maintain zone: add reps before load.
+    assert rec["action"] == "maintain"
+    assert rec["recommended_weight_kg"] == 80
+
+    db.add_strength_session(
+        _day(1),
+        exercises=[{"exercise_name": "Leg Press", "sets": 3, "reps": 10,
+                    "weight_kg": 80, "rpe": 6.5}],
+    )
+    rec = recommend_next_weight(db.exercise_history("Leg Press")[0])
+    assert rec["action"] == "increase"
+    assert rec["recommended_weight_kg"] == 82.5  # one plate step
+
+
+def test_recommendation_backs_off_on_high_rpe_or_pain() -> None:
+    from garmin_coach.progression import recommend_next_weight
+
+    grinding = recommend_next_weight({"best_set_weight_kg": 100, "rpe": 9})
+    assert grinding["action"] == "reduce"
+    assert grinding["recommended_weight_kg"] == 95.0
+
+    hurting = recommend_next_weight(
+        {"best_set_weight_kg": 60, "rpe": 6, "pain_note": "left knee"}
+    )
+    assert hurting["action"] == "reduce"
+
+    unknown = recommend_next_weight({"weight_kg": None})
+    assert unknown["action"] == "log_first"
+    assert unknown["recommended_weight_kg"] is None
+
+
+def test_recovery_caution_blocks_increases(db: Database, monkeypatch) -> None:
+    db.add_strength_session(
+        _day(2),
+        exercises=[{"exercise_name": "Squat", "sets": 3, "reps": 8,
+                    "weight_kg": 100, "rpe": 6}],
+    )
+    db.upsert_readiness(_day(), soreness_1_10=8, energy_1_10=3)
+    db.upsert_sleep(_day(), score=70, total_seconds=6 * 3600)
+
+    from garmin_coach.analysis import Analyzer
+    monkeypatch.setattr(mcp, "analyzer", Analyzer(db))
+
+    result = mcp.recommend_next_weights(exercises=["Squat"])
+    assert "soreness" in result["recovery_caution"]
+    rec = result["recommendations"][0]
+    # RPE 6 would earn an increase, but recovery gates it.
+    assert rec["action"] == "maintain"
+    assert rec["recommended_weight_kg"] == 100
+    assert "recovery says hold" in rec["reason"]
+
+
+def test_recommend_covers_recently_trained_when_unspecified(db: Database, monkeypatch) -> None:
+    db.add_strength_session(
+        _day(5),
+        exercises=[
+            {"exercise_name": "Leg Press", "weight_kg": 80, "sets": 3, "reps": 10, "rpe": 6},
+            {"exercise_name": "Row", "weight_kg": 50, "sets": 3, "reps": 10, "rpe": 8},
+        ],
+    )
+    from garmin_coach.analysis import Analyzer
+    monkeypatch.setattr(mcp, "analyzer", Analyzer(db))
+
+    result = mcp.recommend_next_weights()
+    by_name = {r["exercise"]: r for r in result["recommendations"]}
+    assert result["recovery_caution"] is None
+    assert by_name["Leg Press"]["action"] == "increase"
+    assert by_name["Row"]["action"] == "maintain"
+
+
+def test_stale_readiness_does_not_gate_progress() -> None:
+    from garmin_coach.progression import recovery_caution
+
+    report = {
+        "available": True,
+        "flags": [],
+        "readiness": {"day": _day(5), "soreness_1_10": 9},  # a week old
+    }
+    assert recovery_caution(report) is None
+
+
 # ── Priority 3: training plans and adherence ────────────────────────────────────
 
 def test_training_plan_lifecycle(db: Database) -> None:
