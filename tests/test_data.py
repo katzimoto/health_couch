@@ -138,16 +138,26 @@ def test_analyzer_windows_are_calendar_days(db: Database) -> None:
     assert report["sleep_debt_7d"] is None
 
 
-def test_acr_counts_missing_days_as_rest(db: Database) -> None:
-    # Anchor the history span, then train hard only in the last 7 days.
+def test_acr_flags_recent_spike_and_weighs_rest_days(db: Database) -> None:
+    # Anchor the history span with a quiet day, then train hard only in the
+    # last 7 days: three weeks of rest followed by a sudden block.
     db.upsert_steps(date.today() - timedelta(days=27), steps=4000)
     for i in range(7):
         d = date.today() - timedelta(days=i)
         db.upsert_workout(2000 + i, d, name="Run", type="running", training_load=70)
     acr = Analyzer(db).acute_chronic_ratio()
-    assert acr["acute_7d"] == 70.0
-    assert acr["chronic_28d"] == pytest.approx(17.5)  # 7*70 over 28 calendar days
-    assert acr["ratio"] == 4.0
+    # The acute EWMA reacts fast but the three rest weeks still weigh it down
+    # below the raw session load; the chronic EWMA lags far behind.
+    assert 0 < acr["chronic_28d"] < acr["acute_7d"] < 70
+    assert acr["ratio"] > 1.5  # spike detected
+
+
+def test_acr_steady_load_is_balanced(db: Database) -> None:
+    _seed(db, days=30)  # constant 50 load/day, today inclusive
+    acr = Analyzer(db).acute_chronic_ratio()
+    assert acr["acute_7d"] == pytest.approx(50.0)
+    assert acr["chronic_28d"] == pytest.approx(50.0)
+    assert acr["ratio"] == pytest.approx(1.0)
 
 
 def test_acr_ratio_withheld_for_short_history(db: Database) -> None:

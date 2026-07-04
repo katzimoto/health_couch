@@ -20,6 +20,10 @@ from .database import Database
 # brand-new database would flag a "training spike" on day one.
 _ACR_MIN_HISTORY_DAYS = 21
 
+# Fetch extra history beyond the 28-day chronic span so the chronic EWMA has
+# warmed up past its seed value by the time it reaches today.
+_ACR_WARMUP_DAYS = 56
+
 
 def _avg(values: list[float | int | None]) -> float | None:
     clean = [float(v) for v in values if v is not None]
@@ -34,6 +38,19 @@ def _delta(recent: float | None, baseline: float | None) -> float | None:
 
 def _series(rows: list[dict[str, Any]], key: str) -> list[float | None]:
     return [r.get(key) for r in rows]
+
+
+def _ewma(values: list[float], span_days: int) -> float:
+    """Final exponentially weighted moving average over a daily series.
+
+    Standard span form (λ = 2/(N+1)), seeded on the first value so a steady
+    series converges to itself instead of dragging a zero seed around.
+    """
+    lam = 2.0 / (span_days + 1)
+    ewma = values[0]
+    for v in values[1:]:
+        ewma = v * lam + ewma * (1.0 - lam)
+    return ewma
 
 
 def _window(rows: list[dict[str, Any]], days: int) -> list[dict[str, Any]]:
@@ -80,26 +97,31 @@ class Analyzer:
         return round(sum(target_hours - h for h in hours), 1)
 
     def acute_chronic_ratio(self) -> dict[str, Any]:
-        """Acute (7d) vs chronic (28d) daily training load, and their ratio.
+        """EWMA acute (7d span) vs chronic (28d span) training load and ratio.
 
         >1.5 flags a spike (injury/overtraining risk); <0.8 flags detraining.
-        Days with no data count as zero load — a skipped day is real rest, and
-        dropping it would inflate both averages. The ratio is withheld until
-        the history spans ``_ACR_MIN_HISTORY_DAYS``.
+        EWMA rather than rolling block averages: recent sessions weigh more
+        and the decay of fitness/fatigue is modelled, which the injury-risk
+        literature finds more sensitive than same-weight windows. Days with
+        no data count as zero load — a skipped day is real rest, and dropping
+        it would inflate both curves. The ratio is withheld until the history
+        spans ``_ACR_MIN_HISTORY_DAYS``.
         """
-        rows = self.db.daily_summary(days=28)
+        rows = self.db.daily_summary(days=_ACR_WARMUP_DAYS)
+        if not rows:
+            return {"acute_7d": None, "chronic_28d": None, "ratio": None}
 
-        def daily_load(days: int) -> float:
-            total = sum(r.get("training_load") or 0 for r in _window(rows, days))
-            return round(total / days, 2)
-
-        acute = daily_load(7)
-        chronic = daily_load(28)
-        history_span = (
-            (date.today() - date.fromisoformat(rows[0]["day"])).days + 1 if rows else 0
-        )
+        loads = {r["day"]: float(r.get("training_load") or 0) for r in rows}
+        start = date.fromisoformat(rows[0]["day"])
+        span = (date.today() - start).days + 1
+        series = [
+            loads.get((start + timedelta(days=i)).isoformat(), 0.0)
+            for i in range(span)
+        ]
+        acute = round(_ewma(series, 7), 2)
+        chronic = round(_ewma(series, 28), 2)
         ratio = None
-        if chronic > 0 and history_span >= _ACR_MIN_HISTORY_DAYS:
+        if chronic > 0 and span >= _ACR_MIN_HISTORY_DAYS:
             ratio = round(acute / chronic, 2)
         return {"acute_7d": acute, "chronic_28d": chronic, "ratio": ratio}
 

@@ -157,6 +157,19 @@ class Plan(SQLModel, table=True):
     plan: str
 
 
+class PlanDetail(SQLModel, table=True):
+    """Structured form of a morning plan (priorities/workout/tip as JSON).
+
+    Kept separate from :class:`Plan` (which stores the rendered text) so the
+    existing table needs no migration and text-only fallback plans still save.
+    """
+
+    __tablename__ = "plan_detail"
+    day: str = Field(primary_key=True)
+    ts: datetime = Field(default_factory=_utcnow)
+    data: str  # JSON: {"priorities": [...], "workout": {...}, "recovery_tip": ...}
+
+
 class PullLog(SQLModel, table=True):
     """One row per day successfully pulled from Garmin.
 

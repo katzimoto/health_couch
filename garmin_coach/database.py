@@ -29,6 +29,7 @@ from .models import (
     Hydration,
     Meal,
     Plan,
+    PlanDetail,
     PullLog,
     RestingHr,
     Sleep,
@@ -324,16 +325,35 @@ class Database:
             ).all()
         return [{"day": r.day, "note": r.note} for r in reversed(rows)]
 
-    def save_plan(self, day: str | date, plan: str) -> None:
+    def save_plan(
+        self, day: str | date, plan: str, details: dict[str, Any] | None = None
+    ) -> None:
         from datetime import timezone
         with self.session() as s:
             s.merge(Plan(day=_as_day(day), ts=datetime.now(timezone.utc), plan=plan))
+            if details is not None:
+                s.merge(
+                    PlanDetail(
+                        day=_as_day(day),
+                        ts=datetime.now(timezone.utc),
+                        data=json.dumps(details, ensure_ascii=False),
+                    )
+                )
             s.commit()
 
     def last_plan(self) -> dict[str, Any] | None:
         with self.session() as s:
             row = s.exec(select(Plan).order_by(Plan.day.desc()).limit(1)).first()
-        return {"day": row.day, "plan": row.plan} if row else None
+            if row is None:
+                return None
+            out: dict[str, Any] = {"day": row.day, "plan": row.plan}
+            detail = s.get(PlanDetail, row.day)
+        if detail is not None:
+            try:
+                out["details"] = json.loads(detail.data)
+            except ValueError:
+                pass  # a corrupt details row must not break plan reads
+        return out
 
     # ── Pull log (which days Garmin has been pulled for) ───────────────────────
 
