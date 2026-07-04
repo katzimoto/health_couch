@@ -477,6 +477,72 @@ def test_body_measurement_trend_deltas(db: Database) -> None:
     assert "chest_cm" not in trend["deltas"]  # never measured → absent, not crash
 
 
+# ── On-demand Garmin sync + sync status ─────────────────────────────────────────
+
+class _FakeGarmin:
+    def __init__(self, db, results=None, error=None):
+        self.db = db
+        self.results = results or {"sleep": "ok", "steps": "ok"}
+        self.error = error
+        self.pulled: list[str] = []
+
+    def pull_day(self, day):
+        if self.error:
+            raise self.error
+        self.pulled.append(day)
+        self.db.record_pull(day, self.results)
+        return self.results
+
+
+def test_sync_status_before_any_pull(db: Database) -> None:
+    assert mcp.get_sync_status()["synced_ever"] is False
+
+
+def test_sync_garmin_pulls_and_status_reflects_it(db: Database, monkeypatch) -> None:
+    fake = _FakeGarmin(db)
+    monkeypatch.setattr(mcp, "_garmin", fake)
+
+    result = mcp.sync_garmin()
+    assert result["synced"] is True
+    assert result["day"] == _day()
+    assert result["metrics_ok"] == 2
+    assert fake.pulled == [_day()]
+
+    status = mcp.get_sync_status()
+    assert status["synced_ever"] is True
+    assert status["last_synced_day"] == _day()
+    assert status["minutes_since_last_sync"] < 1
+    assert status["stale"] is False
+    assert status["last_results"] == {"sleep": "ok", "steps": "ok"}
+
+
+def test_sync_cooldown_skips_but_force_and_specific_day_override(
+    db: Database, monkeypatch
+) -> None:
+    fake = _FakeGarmin(db)
+    monkeypatch.setattr(mcp, "_garmin", fake)
+
+    mcp.sync_garmin()
+    repeat = mcp.sync_garmin()  # immediately again — cooldown applies
+    assert repeat["synced"] is False
+    assert "already synced" in repeat["reason"]
+    assert fake.pulled == [_day()]  # no second hit on Garmin
+
+    forced = mcp.sync_garmin(force=True)
+    assert forced["synced"] is True
+    specific = mcp.sync_garmin(day=_day(3))  # explicit day bypasses cooldown
+    assert specific["synced"] is True
+    assert fake.pulled == [_day(), _day(), _day(3)]
+
+
+def test_sync_failure_is_reported_not_raised(db: Database, monkeypatch) -> None:
+    monkeypatch.setattr(mcp, "_garmin", _FakeGarmin(db, error=RuntimeError("401 unauthorized")))
+    result = mcp.sync_garmin(force=True)
+    assert result["synced"] is False
+    assert "401" in result["error"]
+    assert "garmin_login" in result["hint"]
+
+
 # ── Priority 10: hydration ──────────────────────────────────────────────────────
 
 def test_hydration_trend_averages_and_missed_days(db: Database) -> None:

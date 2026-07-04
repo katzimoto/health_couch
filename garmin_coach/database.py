@@ -482,6 +482,20 @@ class Database:
             ).all()
         return set(rows)
 
+    def last_pull(self) -> dict[str, Any] | None:
+        """The most recent Garmin pull: the day it covered, when it ran, and
+        its per-metric results. ``ts`` is updated on every re-pull of a day,
+        so this reflects actual sync recency, not just the newest day."""
+        with self.session() as s:
+            row = s.exec(select(PullLog).order_by(PullLog.ts.desc()).limit(1)).first()
+        if row is None:
+            return None
+        try:
+            status = json.loads(row.status) if row.status else None
+        except ValueError:
+            status = row.status
+        return {"day": row.day, "ts": row.ts, "status": status}
+
     # ── Profile / goals (single row, id=1) ─────────────────────────────────────
 
     def get_profile(self) -> dict[str, Any] | None:
