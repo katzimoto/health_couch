@@ -515,6 +515,45 @@ class Database:
         rpes = [e.get("rpe") for e in exercises if e.get("rpe") is not None]
         return sum(rpes) / len(rpes) if rpes else None
 
+    @staticmethod
+    def _prepare_exercise(ex: dict[str, Any]) -> dict[str, Any]:
+        """Normalise one incoming exercise dict for storage.
+
+        Per-set data (``actual_sets``) is kept verbatim as JSON and also
+        collapsed into the aggregate columns (top weight, average reps/RPE,
+        set count) so single-row history queries keep working. A ``completed:
+        False`` without an explicit status becomes status="skipped"."""
+        ex = dict(ex)
+        actual_sets = ex.pop("actual_sets", None)
+        if actual_sets:
+            ex["set_details"] = json.dumps(actual_sets, ensure_ascii=False)
+            ex.setdefault("sets", len(actual_sets))
+            reps = [s.get("reps") for s in actual_sets if s.get("reps") is not None]
+            if reps and ex.get("reps") is None:
+                ex["reps"] = round(sum(reps) / len(reps))
+            weights = [s.get("weight_kg") for s in actual_sets if s.get("weight_kg") is not None]
+            if weights and ex.get("weight_kg") is None:
+                ex["weight_kg"] = max(weights)
+            rpes = [s.get("rpe") for s in actual_sets if s.get("rpe") is not None]
+            if rpes and ex.get("rpe") is None:
+                ex["rpe"] = round(sum(rpes) / len(rpes), 1)
+        if ex.get("status") is None and ex.get("completed") is False:
+            ex["status"] = "skipped"
+        return ex
+
+    @staticmethod
+    def _exercise_dict(row: StrengthExercise) -> dict[str, Any]:
+        out = row.model_dump()
+        detail = out.pop("set_details", None)
+        if detail:
+            try:
+                out["actual_sets"] = json.loads(detail)
+            except ValueError:
+                out["actual_sets"] = None
+        else:
+            out["actual_sets"] = None
+        return out
+
     def add_strength_session(
         self,
         day: str | date,
@@ -523,14 +562,14 @@ class Database:
     ) -> dict[str, Any]:
         """Create a strength session plus its exercises, mirrored into a
         Workout row (estimated training load) for history and load math."""
-        exercises = exercises or []
+        prepared = [self._prepare_exercise(ex) for ex in (exercises or [])]
         day_str = _as_day(day)
         activity_id = synthetic_activity_id()
         with self.session() as s:
             session_row = StrengthSession(day=day_str, activity_id=activity_id, **fields)
             s.add(session_row)
             s.flush()
-            for ex in exercises:
+            for ex in prepared:
                 s.add(StrengthExercise(session_id=session_row.id, **ex))
             s.commit()
             s.refresh(session_row)
@@ -540,7 +579,7 @@ class Database:
             "strength_training",
             fields.get("duration_s"),
             avg_hr=fields.get("avg_hr"),
-            rpe=self._strength_rpe(exercises),
+            rpe=self._strength_rpe(prepared),
         )
         self.upsert_workout(
             activity_id,
@@ -568,7 +607,7 @@ class Database:
                 .order_by(StrengthExercise.id)
             ).all()
             out = row.model_dump()
-            out["exercises"] = [e.model_dump() for e in exercises]
+            out["exercises"] = [self._exercise_dict(e) for e in exercises]
             return out
 
     def recent_strength_sessions(self, days: int = 30) -> list[dict[str, Any]]:
@@ -601,7 +640,7 @@ class Database:
                 ).all():
                     s.delete(old)
                 for ex in exercises:
-                    s.add(StrengthExercise(session_id=session_id, **ex))
+                    s.add(StrengthExercise(session_id=session_id, **self._prepare_exercise(ex)))
             s.add(row)
             s.commit()
             activity_id, day = row.activity_id, row.day
@@ -661,26 +700,63 @@ class Database:
             ).all()
         history = []
         for exercise, session in rows:
-            volume = None
-            if exercise.sets and exercise.reps and exercise.weight_kg:
-                volume = round(exercise.sets * exercise.reps * exercise.weight_kg, 1)
+            detail = self._exercise_dict(exercise)
+            actual_sets = detail.get("actual_sets") or []
+            per_set = [
+                (s.get("reps"), s.get("weight_kg"))
+                for s in actual_sets
+                if s.get("reps") is not None and s.get("weight_kg") is not None
+            ]
+            if per_set:
+                volume = round(sum(r * w for r, w in per_set), 1)
+                best = max(w for _r, w in per_set)
+            else:
+                volume = (
+                    round(exercise.sets * exercise.reps * exercise.weight_kg, 1)
+                    if exercise.sets and exercise.reps and exercise.weight_kg
+                    else None
+                )
+                best = exercise.weight_kg
             history.append(
                 {
                     "date": session.day,
                     "session_id": session.id,
                     "session_name": session.session_name,
+                    "gym": session.gym,
+                    "machine": exercise.machine,
+                    "planned_sets": exercise.planned_sets,
+                    "planned_reps": exercise.planned_reps,
+                    "planned_weight_kg": exercise.planned_weight_kg,
                     "sets": exercise.sets,
                     "reps": exercise.reps,
                     "weight_kg": exercise.weight_kg,
+                    "actual_sets": actual_sets or None,
                     "estimated_volume_kg": volume,
-                    "best_set_weight_kg": exercise.weight_kg,
+                    "best_set_weight_kg": best,
                     "rpe": exercise.rpe,
                     "rir": exercise.rir,
+                    "status": exercise.status,
+                    "substitute_exercise": exercise.substitute_exercise,
                     "completed": exercise.completed,
                     "pain_note": exercise.pain_note,
                 }
             )
         return history
+
+    def recently_trained_exercises(self, days: int = 120) -> list[str]:
+        """Distinct exercise names trained in the window, most recent first."""
+        with self.session() as s:
+            rows = s.exec(
+                select(StrengthExercise.exercise_name, StrengthSession.day)
+                .where(StrengthExercise.session_id == StrengthSession.id)
+                .where(StrengthSession.day >= self._cutoff(days))
+                .order_by(StrengthSession.day.desc())
+            ).all()
+        seen: list[str] = []
+        for name, _day in rows:
+            if name.lower() not in {n.lower() for n in seen}:
+                seen.append(name)
+        return seen
 
     # ── Training plans (planned workouts + adherence) ──────────────────────────
 

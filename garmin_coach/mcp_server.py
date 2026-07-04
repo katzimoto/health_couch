@@ -33,6 +33,7 @@ from fastmcp.server.auth.providers.workos import AuthKitProvider
 from .analysis import Analyzer
 from .config import settings
 from .database import Database, synthetic_activity_id as _synthetic_activity_id
+from .progression import recommend_next_weight, recovery_caution
 from .training_load import estimate_training_load
 
 log = logging.getLogger("garmin_coach.mcp")
@@ -414,6 +415,7 @@ def log_strength_session(
     exercises: list[dict],
     day: str | None = None,
     session_name: str | None = None,
+    gym: str | None = None,
     duration_s: float | None = None,
     calories: int | None = None,
     avg_hr: int | None = None,
@@ -421,15 +423,19 @@ def log_strength_session(
     notes: str | None = None,
 ) -> dict:
     """Log a detailed strength workout. Each exercise dict may carry:
-    exercise_name (required), sets, reps, weight_kg, rpe, rir, rest_s,
-    completed, pain_note, notes — all except the name optional. The session
-    is mirrored into workout history with an estimated training load, so it
-    counts toward acute:chronic load. Returns the stored session with its
-    ``id`` (for updates) and exercise rows."""
+    exercise_name (required), machine, planned_sets, planned_reps (e.g.
+    "8-10"), planned_weight_kg, sets, reps, weight_kg, rpe, rir, rest_s,
+    status (completed|skipped|substituted), substitute_exercise, pain_note,
+    notes — and/or per-set detail as ``actual_sets``:
+    ``[{"reps": 10, "weight_kg": 80, "rpe": 7}, ...]`` (aggregates are
+    derived automatically). Everything except the name is optional. The
+    session is mirrored into workout history with an estimated training
+    load. Returns the stored session with its ``id`` and exercise rows."""
     return db.add_strength_session(
         day or date.today().isoformat(),
         exercises=exercises,
         session_name=session_name,
+        gym=gym,
         duration_s=duration_s,
         calories=calories,
         avg_hr=avg_hr,
@@ -458,6 +464,7 @@ def update_strength_session(
     session_id: int,
     exercises: list[dict] | None = None,
     session_name: str | None = None,
+    gym: str | None = None,
     duration_s: float | None = None,
     calories: int | None = None,
     avg_hr: int | None = None,
@@ -465,14 +472,42 @@ def update_strength_session(
     notes: str | None = None,
 ) -> dict:
     """Correct a strength session. Only provided fields change; passing
-    ``exercises`` replaces the whole exercise list. The mirrored workout row
-    and its estimated load are refreshed."""
+    ``exercises`` replaces the whole exercise list (same schema as
+    log_strength_session, including ``actual_sets``). The mirrored workout
+    row and its estimated load are refreshed."""
     updated = db.update_strength_session(
-        session_id, exercises=exercises, session_name=session_name,
+        session_id, exercises=exercises, session_name=session_name, gym=gym,
         duration_s=duration_s, calories=calories, avg_hr=avg_hr,
         max_hr=max_hr, notes=notes,
     )
     return updated or {"error": f"no strength session with id {session_id}"}
+
+
+@mcp.tool
+def recommend_next_weights(exercises: list[str] | None = None, days: int = 120) -> dict:
+    """Per-exercise prescription for the next session: recommended weight,
+    increase/maintain/reduce action, and the reasoning — from the last
+    logged performance (RPE-based double progression, 2.5 kg plate steps)
+    gated by current recovery (HRV/sleep/load flags + fresh readiness
+    check-in). Omit ``exercises`` to cover everything trained recently. Use
+    this to write a workout with exact weights instead of guessing."""
+    report = analyzer.report()
+    caution = recovery_caution(report)
+    names = exercises if exercises is not None else db.recently_trained_exercises(days=days)
+    recommendations = []
+    for name in names:
+        history = db.exercise_history(name, days=days, limit=1)
+        if not history:
+            recommendations.append(
+                {"exercise": name, "action": "log_first",
+                 "reason": "no logged history in the window"}
+            )
+            continue
+        rec = recommend_next_weight(history[0], caution)
+        rec["exercise"] = name
+        rec["last_trained"] = history[0]["date"]
+        recommendations.append(rec)
+    return {"recovery_caution": caution, "recommendations": recommendations}
 
 
 @mcp.tool

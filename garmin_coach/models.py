@@ -228,6 +228,7 @@ class StrengthSession(SQLModel, table=True):
     day: str = Field(index=True)
     ts: datetime = Field(default_factory=_utcnow)
     session_name: Optional[str] = None
+    gym: Optional[str] = None  # location, e.g. "Sports Center"
     duration_s: Optional[float] = None
     calories: Optional[int] = None
     avg_hr: Optional[int] = None
@@ -237,16 +238,33 @@ class StrengthSession(SQLModel, table=True):
 
 
 class StrengthExercise(SQLModel, table=True):
+    """One exercise within a strength session.
+
+    ``sets``/``reps``/``weight_kg``/``rpe`` are the working-set aggregate (top
+    weight, average reps/RPE) — kept even when per-set data exists so history
+    queries stay simple. ``set_details`` holds the full per-set JSON
+    (``[{"reps": 10, "weight_kg": 80, "rpe": 7}, ...]``) when the user logs
+    set-by-set. ``planned_*`` capture the prescription so planned-vs-actual
+    comparison works; ``status`` records completed/skipped/substituted.
+    """
+
     __tablename__ = "strength_exercise"
     id: Optional[int] = Field(default=None, primary_key=True)
     session_id: int = Field(index=True, foreign_key="strength_session.id")
     exercise_name: str = Field(index=True)
+    machine: Optional[str] = None  # equipment used, e.g. "45° leg press sled"
+    planned_sets: Optional[int] = None
+    planned_reps: Optional[str] = None  # a range like "8-10" is fine
+    planned_weight_kg: Optional[float] = None
     sets: Optional[int] = None
     reps: Optional[int] = None
     weight_kg: Optional[float] = None
     rpe: Optional[float] = None
     rir: Optional[float] = None
     rest_s: Optional[float] = None
+    set_details: Optional[str] = None  # JSON array of per-set dicts
+    status: Optional[str] = None  # completed | skipped | substituted
+    substitute_exercise: Optional[str] = None
     completed: Optional[bool] = None
     pain_note: Optional[str] = None
     notes: Optional[str] = None
