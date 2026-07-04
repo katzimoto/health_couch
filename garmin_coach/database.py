@@ -5,11 +5,19 @@ hand-written ``daily_summary`` SQL view stitches the metric families together fo
 convenient reads. Upserts are field-preserving (insert-or-update on primary key,
 never overwriting an existing value with ``None``), so re-pulling a day is
 idempotent and a partial write can't erase data a fuller write already stored.
+
+Schema evolution: ``create_all`` only creates *missing tables* — it never alters
+existing ones, so a model gaining a column would otherwise break inserts against
+databases created before the column existed. ``init_schema`` therefore also
+reconciles columns (``_migrate_missing_columns``): any nullable model column
+absent from the live table is added via ``ALTER TABLE ... ADD COLUMN``, which is
+additive, lossless, and idempotent.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -39,6 +47,8 @@ from .models import (
     Weight,
     Workout,
 )
+
+log = logging.getLogger("garmin_coach.database")
 
 # ── The daily_summary view ──────────────────────────────────────────────────────
 # SQLModel/SQLAlchemy does not model views, so we manage this DDL by hand and
@@ -112,6 +122,7 @@ class Database:
 
     def init_schema(self) -> None:
         SQLModel.metadata.create_all(self.engine)
+        self._migrate_missing_columns()
         with self.engine.begin() as conn:
             conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
             try:
@@ -123,6 +134,49 @@ class Database:
                 # racing this one is harmless since both run identical code.
                 if "already exists" not in str(exc):
                     raise
+
+    def _migrate_missing_columns(self) -> None:
+        """Add model columns missing from existing tables (additive, lossless).
+
+        ``create_all`` skips tables that already exist, so a database created
+        before a model gained a column (e.g. the macro fields on ``meal``)
+        would keep failing every INSERT that names it. Only nullable columns
+        are added — that's the only ALTER SQLite allows without a default, and
+        the only migration that can't lose or corrupt existing rows. Runs on
+        every startup; already-present columns are simply skipped.
+        """
+        with self.engine.begin() as conn:
+            for table in SQLModel.metadata.tables.values():
+                rows = conn.exec_driver_sql(
+                    f"PRAGMA table_info('{table.name}')"
+                ).fetchall()
+                existing = {row[1] for row in rows}
+                if not existing:
+                    continue  # brand-new table — create_all already built it fully
+                for column in table.columns:
+                    if column.name in existing:
+                        continue
+                    if not column.nullable:
+                        # SQLite can't ADD a NOT NULL column without a default,
+                        # and guessing a backfill risks corrupting data. Leave
+                        # it to a manual migration rather than crash every
+                        # service at boot.
+                        log.error(
+                            "Cannot auto-migrate NOT NULL column %s.%s — "
+                            "add it manually.", table.name, column.name,
+                        )
+                        continue
+                    coltype = column.type.compile(self.engine.dialect)
+                    try:
+                        conn.exec_driver_sql(
+                            f'ALTER TABLE "{table.name}" '
+                            f'ADD COLUMN "{column.name}" {coltype}'
+                        )
+                    except OperationalError as exc:
+                        # Sibling containers race this migration at startup;
+                        # losing the race to an identical ALTER is harmless.
+                        if "duplicate column" not in str(exc):
+                            raise
 
     # ── Upserts (insert-or-update on primary key, field-preserving) ────────────
 
