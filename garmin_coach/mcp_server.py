@@ -101,8 +101,8 @@ def get_sleep_trend(days: int = 30) -> dict:
 
 @mcp.tool
 def get_training_load(days: int = 28) -> dict:
-    """Acute (7d) vs chronic (28d) training load, their ratio, and recent
-    workouts. Ratio >1.5 = spike, <0.8 = detraining."""
+    """EWMA-weighted acute (7d) vs chronic (28d) training load, their ratio,
+    and recent workouts. Ratio >1.5 = spike, <0.8 = detraining."""
     return {
         "acute_chronic": analyzer.acute_chronic_ratio(),
         "recent_workouts": db.recent_workouts(days=days),
@@ -151,8 +151,8 @@ def get_feedback(days: int = 30) -> list[dict]:
 
 @mcp.tool
 def get_latest_plan() -> dict | None:
-    """The most recently generated morning plan (day + full plan text), or
-    null if none has been generated yet."""
+    """The most recently generated morning plan (day + full plan text, plus
+    structured details when available), or null if none exists yet."""
     return db.last_plan()
 
 
