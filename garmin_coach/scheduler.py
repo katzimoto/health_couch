@@ -3,6 +3,8 @@
 On startup it ensures the database exists and, if it's empty, runs the initial
 backfill. Then it schedules the recurring jobs with APScheduler:
 
+* an hourly Garmin sync of *today*, so the coach, /status and the dashboard
+  track the day as it happens instead of yesterday's snapshot,
 * a daily Garmin pull (early morning, before the plan) that refreshes yesterday
   and today, then heals a few days of any backfill gap,
 * the 07:30 morning-plan push to Telegram (retried with backoff on failure),
@@ -43,8 +45,8 @@ _HEARTBEAT_INTERVAL_MIN = 5
 
 
 class SchedulerService:
-    def __init__(self) -> None:
-        self.db = Database()
+    def __init__(self, db: Database | None = None) -> None:
+        self.db = db or Database()
         self.garmin = GarminClient(self.db)
         self.telegram = TelegramCoach(self.db)
 
@@ -60,6 +62,20 @@ class SchedulerService:
             self.garmin.pull_missing_days()
         except Exception:  # noqa: BLE001
             log.exception("Gap healing failed (will retry tomorrow).")
+        beat("scheduler")
+
+    def hourly_pull(self) -> None:
+        """Refresh today's metrics so the day is tracked as it happens.
+
+        Today only (~9 data-endpoint calls) — yesterday's finalisation and
+        gap healing stay with the daily pull, keeping the added Garmin API
+        pressure modest.
+        """
+        log.info("Running hourly Garmin sync.")
+        try:
+            self.garmin.pull_day(date.today())
+        except Exception:  # noqa: BLE001
+            log.exception("Hourly sync failed (next run in an hour).")
         beat("scheduler")
 
     def initial_backfill_if_empty(self) -> None:
@@ -108,17 +124,9 @@ class SchedulerService:
         except Exception:  # noqa: BLE001
             log.exception("Database backup failed.")
 
-    async def run(self) -> None:
-        # Ensure Garmin auth is usable up front so failures are obvious at boot.
-        try:
-            self.garmin.login()
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "Garmin login failed — run scripts/garmin_login.py to refresh "
-                "tokens. Continuing; jobs will retry."
-            )
-        self.initial_backfill_if_empty()
-
+    def build_scheduler(self) -> AsyncIOScheduler:
+        """Register every recurring job (separate from run() so tests can
+        assert the schedule without starting an event loop)."""
         hour, minute = settings.morning_plan_hm()
         scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
@@ -129,6 +137,18 @@ class SchedulerService:
             CronTrigger(hour=pull_hour, minute=minute, timezone=settings.timezone),
             id="daily_pull",
             replace_existing=True,
+        )
+        # Hourly sync of today, offset 30 min from the daily pull/plan minute
+        # so the two never fire together.
+        hourly_minute = (minute + 30) % 60
+        scheduler.add_job(
+            self.hourly_pull,
+            CronTrigger(minute=hourly_minute, timezone=settings.timezone),
+            id="hourly_pull",
+            replace_existing=True,
+            # If a pull overruns the hour, skip the pile-up, not the schedule.
+            coalesce=True,
+            max_instances=1,
         )
         scheduler.add_job(
             self.morning_plan_job,
@@ -150,12 +170,28 @@ class SchedulerService:
             id="heartbeat",
             replace_existing=True,
         )
+        return scheduler
+
+    async def run(self) -> None:
+        # Ensure Garmin auth is usable up front so failures are obvious at boot.
+        try:
+            self.garmin.login()
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "Garmin login failed — run scripts/garmin_login.py to refresh "
+                "tokens. Continuing; jobs will retry."
+            )
+        self.initial_backfill_if_empty()
+
+        scheduler = self.build_scheduler()
         scheduler.start()
         beat("scheduler")
+        hour, minute = settings.morning_plan_hm()
         log.info(
-            "Scheduler up. Daily pull at %02d:%02d, morning plan at %02d:%02d, "
-            "backup at 03:00 (%s).",
-            pull_hour, minute, hour, minute, settings.timezone,
+            "Scheduler up. Hourly sync at :%02d, daily pull at %02d:%02d, "
+            "morning plan at %02d:%02d, backup at 03:00 (%s).",
+            (minute + 30) % 60, (hour - 1) % 24, minute, hour, minute,
+            settings.timezone,
         )
 
         # Run one pull now so a fresh deploy has current data without waiting
