@@ -17,6 +17,7 @@ def test_all_recurring_jobs_registered(service: SchedulerService) -> None:
     jobs = {job.id: job for job in service.build_scheduler().get_jobs()}
     assert set(jobs) == {
         "hourly_pull", "daily_pull", "morning_plan", "db_backup", "heartbeat",
+        "telegram_reminders",
     }
 
 

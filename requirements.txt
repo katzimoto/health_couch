@@ -6,4 +6,5 @@ openai==2.44.0
 python-telegram-bot==22.8
 APScheduler==3.11.3
 python-dotenv==1.2.2
+python-dateutil==2.9.0.post0
 httpx==0.28.1

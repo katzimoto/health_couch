@@ -328,6 +328,63 @@ class BodyMeasurement(SQLModel, table=True):
     notes: Optional[str] = None
 
 
+class TelegramReminder(SQLModel, table=True):
+    """A scheduled Telegram nudge (meal logging, plans, reports) managed by
+    ChatGPT via the MCP tools or by the user via bot commands.
+
+    ``time`` is local wall-clock ("HH:MM") in ``timezone``; ``next_run_at`` is
+    the precomputed next fire time in UTC, refreshed by the dispatch loop after
+    every send and by edits/resume. Soft-deleted rows (``deleted_at`` set)
+    never fire but keep their delivery history.
+    """
+
+    __tablename__ = "telegram_reminder"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    title: str
+    message: str
+    time: str  # "HH:MM" local wall-clock in `timezone`
+    timezone: str = "Asia/Jerusalem"
+    recurrence: str = "daily"  # once | daily | weekly | weekdays | RRULE:...
+    date: Optional[str] = None  # YYYY-MM-DD; required for "once", anchors "weekly"/RRULE
+    enabled: bool = True
+    tags_json: Optional[str] = None  # JSON array of strings
+    metadata_json: Optional[str] = None  # free-form JSON object
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    last_sent_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = Field(default=None, index=True)
+    deleted_at: Optional[datetime] = None
+
+
+class TelegramReminderDelivery(SQLModel, table=True):
+    """One delivery attempt of a reminder (or an ad-hoc send when
+    ``reminder_id`` is null): sent, error, or missed. Kept forever — editing
+    or deleting a reminder never touches its history."""
+
+    __tablename__ = "telegram_reminder_delivery"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    reminder_id: Optional[int] = Field(default=None, index=True)
+    sent_at: datetime = Field(default_factory=_utcnow)
+    status: str  # sent | error | missed
+    telegram_message_id: Optional[int] = None
+    error: Optional[str] = None
+    meta_json: Optional[str] = None  # tags/metadata for ad-hoc sends
+
+
+class HealthEvent(SQLModel, table=True):
+    """Structured event captured from the user's Telegram replies (meal
+    logged/skipped, hydration, workout done, report/plan requests) so
+    ChatGPT/the coach can read back what actually happened during the day."""
+
+    __tablename__ = "health_event"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    day: str = Field(index=True)
+    ts: datetime = Field(default_factory=_utcnow)
+    kind: str = Field(index=True)  # meal | skipped_meal | hydration | workout_done | free_text | report_request | plan_request
+    source: str = "telegram"
+    payload_json: Optional[str] = None
+
+
 # Map metric-summary column names to the underlying table+model so the
 # database layer can validate/route generic queries.
 SUMMARY_COLUMNS = {

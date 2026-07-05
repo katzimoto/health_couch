@@ -35,12 +35,15 @@ from .config import settings
 from .database import Database, synthetic_activity_id as _synthetic_activity_id
 from .garmin_client import GarminClient
 from .progression import recommend_next_weight, recovery_caution
+from .reminders import DEFAULT_TIMEZONE, Reminders
+from .telegram_sender import send_telegram_message
 from .training_load import estimate_training_load
 
 log = logging.getLogger("garmin_coach.mcp")
 
 db = Database()
 analyzer = Analyzer(db)
+reminders = Reminders(db)
 
 
 def _build_server() -> FastMCP:
@@ -904,6 +907,155 @@ def get_hydration_trend(days: int = 7) -> dict:
         "missed_days": [d for d in window if d not in logged],
         "entries": rows,
     }
+
+
+# ── Telegram reminders ──────────────────────────────────────────────────────────
+
+@mcp.tool
+def create_telegram_reminder(
+    title: str,
+    message: str,
+    time: str,
+    timezone: str = DEFAULT_TIMEZONE,
+    recurrence: str = "daily",
+    date: str | None = None,
+    enabled: bool = True,
+    tags: list[str] | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Create a Telegram reminder the bot will push at ``time`` (HH:MM, local
+    to ``timezone``). recurrence: once | daily | weekly | weekdays | an RRULE
+    string (e.g. "RRULE:FREQ=WEEKLY;BYDAY=MO,TH"); "once" requires ``date``
+    (YYYY-MM-DD), which also anchors "weekly"/RRULE. The user's replies to
+    reminders (meals, /water, /skipped …) land in health events — read them
+    with get_health_events. Idempotent: an existing reminder with the same
+    title, message, time and recurrence is returned (``deduplicated: true``)
+    instead of duplicated. Returns the reminder with its ``id`` and computed
+    ``next_run_at`` (UTC)."""
+    try:
+        return reminders.create(
+            title=title, message=message, time=time, timezone=timezone,
+            recurrence=recurrence, date=date, enabled=enabled,
+            tags=tags, metadata=metadata,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool
+def list_telegram_reminders(
+    enabled_only: bool = False, tag: str | None = None
+) -> list[dict]:
+    """All non-deleted Telegram reminders (id, title, message, time, timezone,
+    recurrence, enabled, tags, created_at, updated_at, last_sent_at,
+    next_run_at). Filter to active ones with ``enabled_only`` or by ``tag``."""
+    return reminders.list(enabled_only=enabled_only, tag=tag)
+
+
+@mcp.tool
+def edit_telegram_reminder(
+    reminder_id: int,
+    title: str | None = None,
+    message: str | None = None,
+    time: str | None = None,
+    timezone: str | None = None,
+    recurrence: str | None = None,
+    date: str | None = None,
+    enabled: bool | None = None,
+    tags: list[str] | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Edit an existing reminder in place — never creates a new one. Partial:
+    only provided fields change; ``next_run_at`` is recomputed, ``created_at``
+    and past delivery records are preserved. Returns the updated reminder."""
+    try:
+        updated = reminders.edit(
+            reminder_id, title=title, message=message, time=time,
+            timezone=timezone, recurrence=recurrence, date=date,
+            enabled=enabled, tags=tags, metadata=metadata,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return updated or {"error": f"no reminder with id {reminder_id}"}
+
+
+@mcp.tool
+def pause_telegram_reminder(reminder_id: int) -> dict:
+    """Pause a reminder (enabled=false) without changing its content or
+    schedule definition. Returns the updated reminder."""
+    updated = reminders.set_enabled(reminder_id, False)
+    return updated or {"error": f"no reminder with id {reminder_id}"}
+
+
+@mcp.tool
+def resume_telegram_reminder(reminder_id: int) -> dict:
+    """Resume a paused reminder: enabled=true and ``next_run_at`` recomputed
+    so it fires at the next scheduled occurrence (not immediately as
+    overdue). Returns the updated reminder."""
+    updated = reminders.set_enabled(reminder_id, True)
+    return updated or {"error": f"no reminder with id {reminder_id}"}
+
+
+@mcp.tool
+def delete_telegram_reminder(reminder_id: int) -> dict:
+    """Soft-delete a reminder: it never fires again and disappears from
+    list_telegram_reminders, but its delivery history is kept."""
+    deleted = reminders.delete(reminder_id)
+    return (
+        {"deleted": True, "reminder_id": reminder_id}
+        if deleted else {"error": f"no reminder with id {reminder_id}"}
+    )
+
+
+@mcp.tool
+def send_telegram_message_now(
+    message: str, tags: list[str] | None = None, metadata: dict | None = None
+) -> dict:
+    """Send a Telegram message to the user immediately (not scheduled) — e.g.
+    a nudge, a heads-up, or an answer they asked to be pinged with. The
+    delivery (or failure) is recorded in the delivery log."""
+    try:
+        message_id = send_telegram_message(message)
+    except Exception as exc:  # noqa: BLE001 — record + surface, don't crash the tool
+        log.exception("Immediate Telegram send failed")
+        reminders.record_ad_hoc("error", error=str(exc), tags=tags, metadata=metadata)
+        return {"sent": False, "error": str(exc)}
+    reminders.record_ad_hoc("sent", telegram_message_id=message_id, tags=tags, metadata=metadata)
+    return {"sent": True, "telegram_message_id": message_id}
+
+
+@mcp.tool
+def create_default_health_reminders(timezone: str = DEFAULT_TIMEZONE) -> list[dict]:
+    """Install the recommended Health Coach reminder set: morning plan
+    (08:00), lunch log (13:00), dinner log (20:00) and evening report (21:30),
+    all daily. Idempotent — reminders that already exist are returned with
+    ``deduplicated: true`` instead of duplicated."""
+    try:
+        return reminders.create_presets(timezone=timezone)
+    except ValueError as exc:
+        return [{"error": str(exc)}]
+
+
+@mcp.tool
+def get_reminder_deliveries(reminder_id: int | None = None, limit: int = 30) -> list[dict]:
+    """Delivery history (sent / error / missed, with timestamps and error
+    text), newest first. Filter to one reminder with ``reminder_id``; ad-hoc
+    send_telegram_message_now records have a null reminder_id. Use this to
+    check whether reminders are actually reaching Telegram."""
+    return reminders.deliveries(reminder_id=reminder_id, limit=max(1, min(limit, 500)))
+
+
+# ── Health events (Telegram-captured logs) ──────────────────────────────────────
+
+@mcp.tool
+def get_health_events(days: int = 7, kind: str | None = None) -> list[dict]:
+    """Structured events the user logged via Telegram over the last ``days``,
+    oldest first: meals (kind=meal), skipped meals (skipped_meal, payload has
+    which meal), hydration (added_ml/total_ml), workouts marked done
+    (workout_done), and plan/report requests. Use these when writing daily
+    reports — they are the ground truth of what the user actually did between
+    reminders. Filter with ``kind``."""
+    return db.recent_health_events(days=max(1, min(days, 365)), kind=kind)
 
 
 def main() -> None:
