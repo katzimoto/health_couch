@@ -61,6 +61,10 @@ health_couch/
 │   ├── telegram_bot.py       # two-way coach, feedback + health-event capture
 │   ├── reminders.py          # Telegram reminder engine (recurrence + CRUD)
 │   ├── telegram_sender.py    # one-shot Bot API sends (reminders, MCP tool)
+│   ├── workout_reminders.py  # reminder-time math for create_workout_reminder_pack
+│   ├── strength_merge.py     # fragment-grouping heuristic for merge_garmin_strength_fragments
+│   ├── nutrition_gaps.py     # missing-meal + pre/post-workout heuristics for get_nutrition_gaps
+│   ├── workout_flow.py       # Telegram guided workout-completion state machine
 │   ├── mcp_server.py         # FastMCP tools for ChatGPT
 │   ├── scheduler.py          # daily pull + 07:30 plan + reminder dispatch
 │   ├── webapp.py             # Starlette web dashboard + JSON API
@@ -141,6 +145,25 @@ health events ChatGPT can read back (`get_health_events`):
 - `/done workout` — marks today's planned workout done
 - `/reminders`, `/edit_reminder <id> <field> <value>`, `/pause_reminder <id>`,
   `/resume_reminder <id>`, `/delete_reminder <id>` — manage reminders in-chat
+
+### 8. Training-day automation (via the ChatGPT connector)
+
+- `update_training_plan` — adjust an existing plan (time, exercises, intensity,
+  status) instead of only creating a new one; every change is auditable.
+- `create_workout_reminder_pack` — from a planned workout, creates linked
+  pre-workout-meal / hydration / gym-start / post-workout-meal / workout-log
+  Telegram reminders; re-running resyncs them if the plan changes instead of
+  duplicating.
+- `get_nutrition_gaps` — remaining calories/macros vs. your profile targets,
+  which meals still look unlogged today, and a concrete suggestion for what
+  to eat next.
+- `merge_garmin_strength_fragments` — folds a gym session Garmin split into
+  several short activities back into one, so training load isn't inflated
+  (`dry_run` to preview; originals are never deleted).
+- `start_workout_log_flow` — kicks off a guided Telegram Q&A after a workout
+  (completed/partial/skipped → duration → per-exercise sets/reps/weight/RPE)
+  that logs a structured strength session and marks the plan done. Reply
+  naturally; `/cancel`, `/skip`, `/done` work at any step.
 
 ---
 

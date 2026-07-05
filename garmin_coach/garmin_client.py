@@ -206,6 +206,7 @@ class GarminClient:
                 training_load=load,
                 source="garmin",
                 load_source=load_source,
+                start_time=_get(act, "startTimeLocal"),
             )
 
     # ── Orchestration ──────────────────────────────────────────────────────────

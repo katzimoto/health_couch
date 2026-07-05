@@ -87,13 +87,21 @@ class Workout(SQLModel, table=True):
     avg_hr: Optional[int] = None
     max_hr: Optional[int] = None
     training_load: Optional[float] = None
-    # Provenance: where the row came from (garmin | apple | manual) and where
-    # its training_load came from (garmin | estimated | manual).
+    # Provenance: where the row came from (garmin | apple | manual | garmin_merged)
+    # and where its training_load came from (garmin | estimated | manual).
     source: Optional[str] = None
     load_source: Optional[str] = None
     # Soft-delete marker for deduplication: points at the kept activity_id.
     # Summaries, training load and default workout reads skip marked rows.
+    # Also reused by merge_garmin_strength_fragments to point same-day Garmin
+    # strength fragments at their canonical "garmin_merged" row.
     duplicate_of: Optional[int] = None
+    # Garmin's startTimeLocal (as returned, e.g. "2026-07-04 18:32:00") — the
+    # only per-workout timestamp we have; used to group same-day strength
+    # fragments that belong to one gym session. Null for manual/legacy rows.
+    start_time: Optional[str] = None
+    # Free-form JSON provenance, e.g. {"fragment_ids": [...]} on a merged row.
+    meta_json: Optional[str] = None
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -296,6 +304,18 @@ class TrainingPlan(SQLModel, table=True):
     actual_duration_s: Optional[float] = None
     difficulty_rpe: Optional[float] = None
     skip_reason: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+
+class TrainingPlanEdit(SQLModel, table=True):
+    """Audit trail for update_training_plan: one row per call that actually
+    changed a field, so "why did today's plan change" is answerable later."""
+
+    __tablename__ = "training_plan_edit"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    plan_id: int = Field(index=True, foreign_key="training_plan.id")
+    ts: datetime = Field(default_factory=_utcnow)
+    changes_json: str  # {"field": {"old": ..., "new": ...}, ...}
 
 
 class Readiness(SQLModel, table=True):
@@ -383,6 +403,30 @@ class HealthEvent(SQLModel, table=True):
     kind: str = Field(index=True)  # meal | skipped_meal | hydration | workout_done | free_text | report_request | plan_request
     source: str = "telegram"
     payload_json: Optional[str] = None
+
+
+class WorkoutLogFlow(SQLModel, table=True):
+    """State for the Telegram guided workout-completion conversation, so it
+    survives across separate incoming messages. One open (``completed_at``
+    null) flow per plan at a time — ``start_workout_log_flow`` reuses it
+    instead of starting a second, conflicting conversation."""
+
+    __tablename__ = "workout_log_flow"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    plan_id: int = Field(index=True)
+    reminder_id: Optional[int] = None
+    timezone: str = "Asia/Jerusalem"
+    # awaiting_completion|awaiting_skip_reason|awaiting_duration|awaiting_exercises|done
+    step: str = "awaiting_completion"
+    completion_status: Optional[str] = None  # yes|partial|skipped
+    duration_s: Optional[float] = None
+    exercises_json: Optional[str] = None  # JSON array of exercises collected so far
+    current_exercise_index: int = 0
+    notes: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    completed_at: Optional[datetime] = None
+    result_json: Optional[str] = None  # final confirmation summary, once done
 
 
 # Map metric-summary column names to the underlying table+model so the

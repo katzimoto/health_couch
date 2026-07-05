@@ -36,7 +36,7 @@ log = logging.getLogger("garmin_coach.reminders")
 
 DEFAULT_TIMEZONE = "Asia/Jerusalem"
 
-_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 _MAX_ERROR_LEN = 500
 
 
@@ -66,7 +66,7 @@ def compute_next_run(
     can reject a reminder at create/edit time rather than discover it in the
     dispatch loop.
     """
-    match = _TIME_RE.match((time_str or "").strip())
+    match = TIME_RE.match((time_str or "").strip())
     if not match:
         raise ValueError(f"time must be HH:MM (24h), got {time_str!r}")
     hour, minute = int(match[1]), int(match[2])
