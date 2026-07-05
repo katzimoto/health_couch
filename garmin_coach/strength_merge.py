@@ -55,22 +55,26 @@ def group_fragments(
 ) -> list[list[dict[str, Any]]]:
     """Group same-day fragments that likely belong to one gym session.
 
-    Fragments are ordered by start time and split wherever the gap from one
-    fragment's end to the next's start exceeds ``max_gap_minutes``. When any
-    fragment lacks a parseable start time, timing can't be trusted to split
-    the day safely, so every fragment is treated as one candidate session
-    instead of risking a wrong split.
+    Fragments with a parseable start time are ordered by it and split
+    wherever the gap from one fragment's end to the next's start exceeds
+    ``max_gap_minutes``. A fragment with no parseable start time can't be
+    placed relative to the others at all — rather than guess, it's kept on
+    its own (a singleton "group" too small to merge on its own), so one
+    untimed fragment can never force two genuinely separate sessions to be
+    merged into one.
     """
     if not fragments:
         return []
     parsed = [(_parse_start(f.get("start_time")), f) for f in fragments]
-    if any(start is None for start, _ in parsed):
-        return [list(fragments)]
+    dated = sorted((pair for pair in parsed if pair[0] is not None), key=lambda pair: pair[0])
+    undated = [frag for start, frag in parsed if start is None]
 
-    parsed.sort(key=lambda pair: pair[0])
-    groups: list[list[dict[str, Any]]] = [[parsed[0][1]]]
-    prev_start, prev_frag = parsed[0]
-    for start, frag in parsed[1:]:
+    if not dated:
+        return [[frag] for frag in undated]
+
+    groups: list[list[dict[str, Any]]] = [[dated[0][1]]]
+    prev_start, prev_frag = dated[0]
+    for start, frag in dated[1:]:
         prev_end = prev_start + timedelta(seconds=prev_frag.get("duration_s") or 0)
         gap_minutes = (start - prev_end).total_seconds() / 60.0
         if gap_minutes <= max_gap_minutes:
@@ -78,6 +82,7 @@ def group_fragments(
         else:
             groups.append([frag])
         prev_start, prev_frag = start, frag
+    groups.extend([frag] for frag in undated)
     return groups
 
 

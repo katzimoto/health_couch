@@ -1251,65 +1251,29 @@ class Database:
 
     # ── Garmin strength-fragment merging ────────────────────────────────────────
 
-    def merge_garmin_strength_fragments(
+    def _plan_strength_merge(
         self,
-        day: str | date,
-        dry_run: bool = False,
-        min_fragments: int = 2,
-        max_gap_minutes: float = 90.0,
+        day_str: str,
+        group: list[dict[str, Any]],
+        existing_fragment_sets: dict[int, set[int]],
+        dry_run: bool,
     ) -> dict[str, Any]:
-        """Merge same-day Garmin strength-training fragments into one
-        canonical workout so training load/recovery math isn't inflated by
-        a session the watch recorded as several short activities.
-
-        Only ``source="garmin"`` activities of a strength-like type are
-        considered — manual logs and already-merged rows are untouched.
-        Originals are never deleted: they're marked ``duplicate_of`` the
-        merged row (the same mechanism ``dedupe_workouts`` uses), so
-        summaries/training load/workout counts see the session once while
-        the raw Garmin rows stay in the database. Re-running for the same
-        day (dry_run or not) is idempotent — it recomputes and updates the
-        existing merged row instead of creating a second one.
+        """Compute (and, unless ``dry_run``, apply) the merge of one group of
+        same-day fragments. ``existing_fragment_sets`` maps a previously
+        merged row's activity_id to the fragment ids it currently covers —
+        matched by *overlap* rather than exact equality, so a merge stays
+        idempotent even if a delayed Garmin sync adds one more fragment to an
+        already-merged session on a later call.
         """
-        from .strength_merge import group_fragments, is_strength_like, weighted_avg_hr
-
-        day_str = _as_day(day)
-        with self.session() as s:
-            # Not filtered by duplicate_of: a fragment already merged (by an
-            # earlier call, for idempotency) must still be found so it can be
-            # regrouped and re-matched to its existing merged row.
-            rows = s.exec(
-                select(Workout)
-                .where(Workout.day == day_str)
-                .where(Workout.source == "garmin")
-            ).all()
-            fragments = [r.model_dump() for r in rows if is_strength_like(r.type)]
-
-        if len(fragments) < max(1, min_fragments):
-            return {
-                "day": day_str, "dry_run": dry_run, "merged": False,
-                "reason": (
-                    f"found {len(fragments)} strength fragment(s) — need at "
-                    f"least {min_fragments} to merge"
-                ),
-                "fragment_ids": sorted(f["activity_id"] for f in fragments),
-            }
-
-        groups = group_fragments(fragments, max_gap_minutes=max_gap_minutes)
-        mergeable = [g for g in groups if len(g) >= min_fragments]
-        if not mergeable:
-            return {
-                "day": day_str, "dry_run": dry_run, "merged": False,
-                "reason": "fragments are too far apart in time to be one session",
-                "groups": [sorted(f["activity_id"] for f in g) for g in groups],
-            }
-        group = max(mergeable, key=len)
+        from .strength_merge import weighted_avg_hr
 
         before_load = round(sum(f.get("training_load") or 0 for f in group), 1)
         total_duration = sum(f.get("duration_s") or 0 for f in group) or None
         total_calories = round(sum(f.get("calories") or 0 for f in group)) or None
         avg_hr = weighted_avg_hr(group)
-        max_hr = max((f["max_hr"] for f in group if f.get("max_hr")), default=None)
+        max_hr = max(
+            (f["max_hr"] for f in group if f.get("max_hr") is not None), default=None
+        )
         load_after = estimate_training_load("strength_training", total_duration, avg_hr=avg_hr)
         if load_after is None:
             load_after = before_load
@@ -1317,8 +1281,7 @@ class Database:
 
         if dry_run:
             return {
-                "day": day_str, "dry_run": True, "merged": False,
-                "would_merge": True,
+                "merged": False, "would_merge": True,
                 "fragment_ids": fragment_ids,
                 "total_duration_s": total_duration,
                 "total_calories": total_calories,
@@ -1328,18 +1291,14 @@ class Database:
                 "training_load_after": load_after,
             }
 
-        with self.session() as s:
-            existing_merged = s.exec(
-                select(Workout).where(
-                    Workout.day == day_str, Workout.source == "garmin_merged"
-                )
-            ).all()
-        merged_id = None
-        for existing in existing_merged:
-            meta = json.loads(existing.meta_json) if existing.meta_json else {}
-            if sorted(meta.get("fragment_ids", [])) == fragment_ids:
-                merged_id = existing.activity_id
-                break
+        fragment_id_set = set(fragment_ids)
+        merged_id = next(
+            (
+                activity_id for activity_id, ids in existing_fragment_sets.items()
+                if ids & fragment_id_set
+            ),
+            None,
+        )
         if merged_id is None:
             merged_id = synthetic_activity_id()
 
@@ -1365,8 +1324,7 @@ class Database:
             s.commit()
 
         return {
-            "day": day_str, "dry_run": False, "merged": True,
-            "merged_activity_id": merged_id,
+            "merged": True, "merged_activity_id": merged_id,
             "fragment_ids": fragment_ids,
             "total_duration_s": total_duration,
             "total_calories": total_calories,
@@ -1375,6 +1333,90 @@ class Database:
             "training_load_before": before_load,
             "training_load_after": load_after,
         }
+
+    def merge_garmin_strength_fragments(
+        self,
+        day: str | date,
+        dry_run: bool = False,
+        min_fragments: int = 2,
+        max_gap_minutes: float = 90.0,
+    ) -> dict[str, Any]:
+        """Merge same-day Garmin strength-training fragments into one
+        canonical workout so training load/recovery math isn't inflated by
+        a session the watch recorded as several short activities.
+
+        Only ``source="garmin"`` activities of a strength-like type are
+        considered — manual logs and already-merged rows are untouched.
+        Originals are never deleted: they're marked ``duplicate_of`` the
+        merged row (the same mechanism ``dedupe_workouts`` uses), so
+        summaries/training load/workout counts see the session once while
+        the raw Garmin rows stay in the database. Re-running for the same
+        day (dry_run or not) is idempotent — it recomputes and updates the
+        existing merged row(s) instead of creating new ones. If more than
+        one group of fragments qualifies (e.g. two separate gym visits the
+        same day), every qualifying group is merged: the largest is
+        reported at the top level and the rest under ``other_merges`` — so
+        a smaller second session is never left permanently double-counted.
+        """
+        from .strength_merge import group_fragments, is_strength_like
+
+        day_str = _as_day(day)
+        with self.session() as s:
+            # Not filtered by duplicate_of: a fragment already merged (by an
+            # earlier call, for idempotency) must still be found so it can be
+            # regrouped and re-matched to its existing merged row.
+            rows = s.exec(
+                select(Workout)
+                .where(Workout.day == day_str)
+                .where(Workout.source == "garmin")
+            ).all()
+            fragments = [r.model_dump() for r in rows if is_strength_like(r.type)]
+
+        if len(fragments) < max(1, min_fragments):
+            return {
+                "day": day_str, "dry_run": dry_run, "merged": False,
+                "reason": (
+                    f"found {len(fragments)} strength fragment(s) — need at "
+                    f"least {min_fragments} to merge"
+                ),
+                "fragment_ids": sorted(f["activity_id"] for f in fragments),
+            }
+
+        groups = group_fragments(fragments, max_gap_minutes=max_gap_minutes)
+        mergeable = sorted(
+            (g for g in groups if len(g) >= min_fragments), key=len, reverse=True
+        )
+        if not mergeable:
+            return {
+                "day": day_str, "dry_run": dry_run, "merged": False,
+                "reason": "fragments are too far apart in time to be one session",
+                "groups": [sorted(f["activity_id"] for f in g) for g in groups],
+            }
+
+        existing_fragment_sets: dict[int, set[int]] = {}
+        if not dry_run:
+            with self.session() as s:
+                existing_merged = s.exec(
+                    select(Workout).where(
+                        Workout.day == day_str, Workout.source == "garmin_merged"
+                    )
+                ).all()
+            for existing in existing_merged:
+                try:
+                    ids = json.loads(existing.meta_json) if existing.meta_json else {}
+                except ValueError:
+                    ids = {}
+                existing_fragment_sets[existing.activity_id] = set(ids.get("fragment_ids", []))
+
+        merges = [
+            self._plan_strength_merge(day_str, group, existing_fragment_sets, dry_run)
+            for group in mergeable
+        ]
+        primary, *others = merges
+        result = {"day": day_str, "dry_run": dry_run, **primary}
+        if others:
+            result["other_merges"] = others
+        return result
 
     # ── Backup ─────────────────────────────────────────────────────────────────
 

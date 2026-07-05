@@ -751,24 +751,30 @@ def log_plan_feedback(plan_id: int, feedback: str) -> dict:
 
 _REMINDER_PACK_TAG = "workout_reminder_pack"
 
-# (title, message template — {title} is the plan's title, {time} its HH:MM start)
+# (title, message template — {title} the plan's title, {time} its HH:MM start,
+# {date} the workout's date). The date is always folded into the message:
+# Reminders.create() dedupes on (title, message, time, recurrence) alone, not
+# date, so a recurring plan with the same title/time on a later date would
+# otherwise be "deduplicated" into a past instance's row instead of getting
+# its own — silently losing the new reminder and corrupting the old one's
+# metadata. Baking the date into the message keeps every instance distinct.
 _REMINDER_PACK_COPY: dict[str, tuple[str, str]] = {
     "pre_workout_meal": (
         "Pre-workout meal",
-        "Eat a pre-workout meal before {title} at {time}.",
+        "Eat a pre-workout meal before {title} at {time} on {date}.",
     ),
     "hydration": (
         "Hydration",
-        "Hydrate before {title} at {time} — water/electrolytes now.",
+        "Hydrate before {title} at {time} on {date} — water/electrolytes now.",
     ),
-    "gym_start": ("Workout time", "Time to start: {title}."),
+    "gym_start": ("Workout time", "Time to start: {title} ({date})."),
     "post_workout_meal": (
         "Post-workout meal",
-        "Eat your post-workout meal — protein + carbs to kick off recovery.",
+        "Eat your post-workout meal — protein + carbs to kick off recovery ({date}).",
     ),
     "workout_log": (
         "Log your workout",
-        "Log how {title} went (sets/reps/RPE) so tomorrow's plan can adjust.",
+        "Log how {title} went (sets/reps/RPE) so tomorrow's plan can adjust ({date}).",
     ),
 }
 
@@ -842,7 +848,7 @@ def create_workout_reminder_pack(
     for reminder_type in wanted_types:
         r_date, r_time = times[reminder_type]
         heading, message_tpl = _REMINDER_PACK_COPY[reminder_type]
-        message = message_tpl.format(title=title, time=time_str)
+        message = message_tpl.format(title=title, time=time_str, date=r_date)
         metadata = {
             "plan_id": plan_id, "reminder_type": reminder_type,
             "workout_date": workout_date, "workout_time": time_str,
@@ -864,10 +870,18 @@ def create_workout_reminder_pack(
             recurrence="once", date=r_date,
             tags=[_REMINDER_PACK_TAG, reminder_type], metadata=metadata,
         )
+        # Defense in depth: Reminders.create() dedupes on (title, message,
+        # time, recurrence) only, not date — if it ever returns an unrelated
+        # past reminder that slipped through despite the date being baked
+        # into the message above, force it back in sync rather than silently
+        # keeping its stale date/time.
+        was_deduplicated = created.get("deduplicated", False)
+        if created["date"] != r_date or created["time"] != r_time:
+            created = reminders.edit(created["id"], time=r_time, date=r_date, message=message)
         results.append({
             "type": reminder_type, "time": r_time,
             "reminder_id": created["id"],
-            "deduplicated": created.get("deduplicated", False),
+            "deduplicated": was_deduplicated,
             "_metadata": created.get("metadata") or {},
         })
 
@@ -1122,7 +1136,9 @@ def merge_garmin_strength_fragments(
     ``duplicate_of`` the merged row (same mechanism as dedupe_workouts), so
     they drop out of summaries/training load/workout counts but stay in the
     database. Idempotent: re-running for the same day updates the existing
-    merged row instead of creating another one."""
+    merged row(s) instead of creating new ones. If two separate qualifying
+    sessions happened the same day, the largest is reported at the top
+    level and any others under ``other_merges``."""
     return db.merge_garmin_strength_fragments(
         day, dry_run=dry_run,
         min_fragments=max(1, min_fragments),

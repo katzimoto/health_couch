@@ -44,13 +44,19 @@ _SKIP_REASON_PROMPT = "What's the reason (tired, sick, no time, ...)? Or /skip t
 _DURATION_PROMPT = "How long did it take (minutes)? Or /skip to use the planned duration."
 
 
+_WORD_RE = re.compile(r"[a-z']+")
+
+
 def parse_completion(text: str) -> str | None:
-    t = (text or "").strip().lower()
-    if any(w in t for w in _SKIP_WORDS):
+    # Whole-word matching, not substring: "gym was closed" must not match
+    # the bare "y" in _YES_WORDS, nor "not sure" match the bare "no" in
+    # _SKIP_WORDS (which "not" contains as a substring).
+    words = set(_WORD_RE.findall((text or "").lower()))
+    if words & _SKIP_WORDS:
         return "skipped"
-    if any(w in t for w in _PARTIAL_WORDS):
+    if words & _PARTIAL_WORDS:
         return "partial"
-    if any(w in t for w in _YES_WORDS):
+    if words & _YES_WORDS:
         return "yes"
     return None
 
@@ -241,11 +247,17 @@ class WorkoutLogFlows:
     def _dump(self, row: WorkoutLogFlow) -> dict[str, Any]:
         out = row.model_dump()
         raw = out.pop("exercises_json", None)
-        data = json.loads(raw) if raw else {}
+        try:
+            data = json.loads(raw) if raw else {}
+        except ValueError:
+            data = {}  # a corrupt row must not break the flow read
         out["planned_exercises"] = data.get("planned", [])
         out["logged_exercises"] = data.get("logged", [])
         result_raw = out.pop("result_json", None)
-        out["result"] = json.loads(result_raw) if result_raw else None
+        try:
+            out["result"] = json.loads(result_raw) if result_raw else None
+        except ValueError:
+            out["result"] = None
         return out
 
     @staticmethod
@@ -263,14 +275,23 @@ class WorkoutLogFlows:
         if plan is None:
             raise ValueError(f"no training plan with id {plan_id}")
         with self.db.session() as s:
-            existing = s.exec(
+            open_flows = s.exec(
                 select(WorkoutLogFlow).where(
-                    WorkoutLogFlow.plan_id == plan_id,
-                    WorkoutLogFlow.completed_at == None,  # noqa: E711
+                    WorkoutLogFlow.completed_at == None  # noqa: E711
                 )
-            ).first()
+            ).all()
+            existing = next((f for f in open_flows if f.plan_id == plan_id), None)
             if existing is not None:
                 return {"flow_id": existing.id, "prompt": _COMPLETION_PROMPT, "reused": True}
+            # Only one flow can be "active" (a single Telegram chat can only
+            # be replying to one conversation at a time) — an open flow for
+            # a different plan would otherwise be silently orphaned, never
+            # routed to again and never finished.
+            now = datetime.now(tz_utc.utc)
+            for other in open_flows:
+                other.completed_at = now
+                other.updated_at = now
+                s.add(other)
             row = WorkoutLogFlow(plan_id=plan_id, reminder_id=reminder_id, timezone=timezone)
             s.add(row)
             s.commit()

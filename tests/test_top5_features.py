@@ -118,6 +118,25 @@ def test_reminder_pack_is_idempotent(db: Database) -> None:
     assert all(r["deduplicated"] is True for r in second["reminders"])
 
 
+def test_reminder_pack_does_not_collide_across_different_dated_plans(db: Database) -> None:
+    """Two different plans with the same title/time on different days must
+    each get their own reminders — Reminders.create()'s own dedup ignores
+    date, so this only works if the pack bakes the date into the message."""
+    plan_a = db.create_training_plan(_day(10), title="Push day", planned_start_time="18:00")
+    plan_b = db.create_training_plan(_day(3), title="Push day", planned_start_time="18:00")
+
+    result_a = mcp.create_workout_reminder_pack(plan_a["id"])
+    result_b = mcp.create_workout_reminder_pack(plan_b["id"])
+
+    ids_a = {r["type"]: r["reminder_id"] for r in result_a["reminders"]}
+    ids_b = {r["type"]: r["reminder_id"] for r in result_b["reminders"]}
+    assert set(ids_a.values()).isdisjoint(ids_b.values())
+    assert all(r["deduplicated"] is False for r in result_b["reminders"])
+
+    gym_start_b = mcp.reminders.get(ids_b["gym_start"])
+    assert gym_start_b["date"] == _day(3)  # not silently left on plan_a's date
+
+
 def test_reminder_pack_resyncs_when_plan_time_changes(db: Database) -> None:
     plan = db.create_training_plan(_day(), title="Push day", planned_start_time="18:00")
     first = mcp.create_workout_reminder_pack(plan["id"])
@@ -268,6 +287,70 @@ def test_merge_skips_when_too_few_fragments(db: Database) -> None:
     assert "need at least" in result["reason"]
 
 
+def test_merge_stays_idempotent_when_a_delayed_fragment_arrives(db: Database) -> None:
+    """A 3rd fragment syncing in late (delayed watch upload) must extend the
+    existing merged row instead of creating a second, double-counting one."""
+    day = _day()
+    _seed_fragments(db, day, ["2026-07-04 18:00:00", "2026-07-04 18:15:00"])
+    first = mcp.merge_garmin_strength_fragments(day)
+
+    db.upsert_workout(
+        500_099, day, name="Strength late", type="strength_training",
+        duration_s=600, calories=60, avg_hr=125, max_hr=145,
+        training_load=13.0, source="garmin", load_source="garmin",
+        start_time="2026-07-04 18:35:00",
+    )
+    second = mcp.merge_garmin_strength_fragments(day)
+    assert second["merged_activity_id"] == first["merged_activity_id"]
+    assert len(second["fragment_ids"]) == 3
+    merged_rows = [w for w in db.recent_workouts(days=2) if w["source"] == "garmin_merged"]
+    assert len(merged_rows) == 1  # not a second merged row
+    assert db.latest_summary()["workout_count"] == 1  # no double counting
+
+
+def test_merge_handles_two_qualifying_sessions_same_day(db: Database) -> None:
+    day = _day()
+    _seed_fragments(
+        db, day,
+        ["2026-07-04 07:00:00", "2026-07-04 07:15:00",  # morning session (2)
+         "2026-07-04 19:00:00", "2026-07-04 19:15:00", "2026-07-04 19:35:00"],  # evening (3)
+    )
+    result = mcp.merge_garmin_strength_fragments(day)
+    assert result["merged"] is True
+    assert len(result["fragment_ids"]) == 3  # largest reported at top level
+    assert len(result["other_merges"]) == 1
+    assert result["other_merges"][0]["merged"] is True
+    assert len(result["other_merges"][0]["fragment_ids"]) == 2
+
+    merged_rows = [w for w in db.recent_workouts(days=2) if w["source"] == "garmin_merged"]
+    assert len(merged_rows) == 2  # both sessions got their own canonical row
+    assert db.latest_summary()["workout_count"] == 2
+
+
+def test_merge_does_not_blend_distant_sessions_when_one_fragment_is_undated(db: Database) -> None:
+    """A single fragment with no start_time must not force two genuinely
+    separate, far-apart sessions into one merged group."""
+    day = _day()
+    ids = _seed_fragments(
+        db, day,
+        ["2026-07-04 07:00:00", "2026-07-04 07:15:00",  # morning session
+         "2026-07-04 19:00:00", "2026-07-04 19:15:00"],  # evening session
+    )
+    db.upsert_workout(  # a 5th fragment with no timing info at all
+        500_098, day, name="Strength unknown-time", type="strength_training",
+        duration_s=600, source="garmin", load_source="garmin", training_load=10.0,
+    )
+    result = mcp.merge_garmin_strength_fragments(day)
+    assert result["merged"] is True
+    all_merged_ids = set(result["fragment_ids"])
+    for other in result.get("other_merges", []):
+        all_merged_ids |= set(other["fragment_ids"])
+    # The two real, timed sessions are each merged (2 fragments each); the
+    # untimed fragment is never folded into either one.
+    assert all(fid in ids for fid in all_merged_ids)
+    assert 500_098 not in all_merged_ids
+
+
 def test_merge_splits_sessions_far_apart(db: Database) -> None:
     day = _day()
     _seed_fragments(
@@ -307,6 +390,14 @@ def test_parse_completion_variants() -> None:
     assert parse_completion("partially, only did half") == "partial"
     assert parse_completion("skipped, was too tired") == "skipped"
     assert parse_completion("banana") is None
+
+
+def test_parse_completion_does_not_false_positive_on_substrings() -> None:
+    # "gym" contains "y" (a _YES_WORDS entry) and "not sure" contains "no"
+    # (a _SKIP_WORDS entry) as bare substrings — word-boundary matching must
+    # not be fooled by either.
+    assert parse_completion("gym was closed") is None
+    assert parse_completion("not sure yet") is None
 
 
 def test_parse_duration_seconds_variants() -> None:
@@ -451,6 +542,23 @@ def test_flow_start_is_idempotent_while_open(db: Database, flows: WorkoutLogFlow
 def test_flow_unknown_plan_raises(db: Database, flows: WorkoutLogFlows) -> None:
     with pytest.raises(ValueError):
         flows.start(999_999)
+
+
+def test_flow_starting_for_a_new_plan_supersedes_the_orphaned_one(
+    db: Database, flows: WorkoutLogFlows
+) -> None:
+    """Only one Telegram conversation can be active at a time — starting a
+    flow for plan B while plan A's is still open must close A out instead of
+    leaving it silently unreachable forever."""
+    plan_a = db.create_training_plan(_day(), title="Leg day")
+    plan_b = db.create_training_plan(_day(), title="Push day")
+
+    flow_a = flows.start(plan_a["id"])["flow_id"]
+    flow_b = flows.start(plan_b["id"])["flow_id"]
+
+    assert flows.get(flow_a)["completed_at"] is not None  # superseded, not orphaned
+    assert flows.get(flow_b)["completed_at"] is None
+    assert flows.active_flow()["id"] == flow_b
 
 
 def test_start_workout_log_flow_tool_pushes_prompt(db: Database, monkeypatch) -> None:
