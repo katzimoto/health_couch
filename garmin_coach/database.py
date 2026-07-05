@@ -41,6 +41,7 @@ from .models import (
     BodyMeasurement,
     Conversation,
     Feedback,
+    HealthEvent,
     Hrv,
     Hydration,
     Meal,
@@ -410,6 +411,77 @@ class Database:
                 stmt = stmt.where(Vital.metric == metric)
             rows = s.exec(stmt.limit(days * 10)).all()
         return [r.model_dump() for r in reversed(rows)]
+
+    # ── Health events (structured Telegram-captured logs) ─────────────────────
+
+    @staticmethod
+    def _event_dict(row: HealthEvent) -> dict[str, Any]:
+        out = row.model_dump()
+        raw = out.pop("payload_json", None)
+        try:
+            out["payload"] = json.loads(raw) if raw else None
+        except ValueError:
+            out["payload"] = raw  # a corrupt payload must not break event reads
+        return out
+
+    def add_health_event(
+        self,
+        kind: str,
+        payload: dict[str, Any] | None = None,
+        day: str | date | None = None,
+        source: str = "telegram",
+    ) -> dict[str, Any]:
+        with self.session() as s:
+            row = HealthEvent(
+                kind=kind,
+                source=source,
+                day=_as_day(day or date.today()),
+                payload_json=(
+                    json.dumps(payload, ensure_ascii=False)
+                    if payload is not None else None
+                ),
+            )
+            s.add(row)
+            s.commit()
+            s.refresh(row)
+            return self._event_dict(row)
+
+    def recent_health_events(
+        self, days: int = 7, kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self.session() as s:
+            stmt = (
+                select(HealthEvent)
+                .where(HealthEvent.day >= self._cutoff(days))
+                .order_by(HealthEvent.day, HealthEvent.id)
+            )
+            if kind:
+                stmt = stmt.where(HealthEvent.kind == kind)
+            rows = s.exec(stmt).all()
+        return [self._event_dict(r) for r in rows]
+
+    def health_events_for_day(self, day: str | date) -> list[dict[str, Any]]:
+        with self.session() as s:
+            rows = s.exec(
+                select(HealthEvent)
+                .where(HealthEvent.day == _as_day(day))
+                .order_by(HealthEvent.id)
+            ).all()
+        return [self._event_dict(r) for r in rows]
+
+    def add_hydration_intake(self, ml: int, day: str | date | None = None) -> int:
+        """Add ``ml`` to the day's hydration total and return the new total.
+
+        Distinct from ``upsert_hydration``, which *sets* the total — /water 500
+        must accumulate across the day, not overwrite earlier glasses.
+        """
+        day_str = _as_day(day or date.today())
+        with self.session() as s:
+            row = s.get(Hydration, day_str)
+            current = row.intake_ml if row and row.intake_ml is not None else 0
+        total = current + int(ml)
+        self.upsert_hydration(day_str, intake_ml=total)
+        return total
 
     # ── Conversation memory ────────────────────────────────────────────────────
 

@@ -72,6 +72,26 @@ field on the data and flags; if the data says rest, prescribe rest. Keep each \
 string short — this renders into a Telegram message.
 """
 
+_EVENING_INSTRUCTION = """\
+Write today's evening report. Use this structure and keep it tight (a Telegram
+message, so short lines, minimal markdown):
+
+🌙 Evening report
+
+📋 Plan vs actual: how today went against the morning plan (use the plan,
+training-plan status and logged events)
+🍽 Meals & macros: totals vs targets; call out skipped or unlogged meals
+💧 Hydration / 👣 steps / 🏋️ training: the day's numbers
+🛌 Recovery: anything in the data worth noting for tomorrow
+
+✅ One thing that went well
+🔁 One thing to improve tomorrow
+
+Base every line on the data provided. If something wasn't logged, say so
+plainly instead of guessing.
+"""
+
+
 # Strict json_schema keeps the plan machine-readable (per-item adherence
 # tracking) and immune to format drift. Only strict-mode-supported keywords
 # here — "exactly 3 priorities" is enforced by the instruction, not minItems.
@@ -218,6 +238,44 @@ class Coach:
         self.db.add_message("assistant", plan)
         log.info("Generated morning plan (%d chars).", len(plan))
         return plan
+
+    def evening_report(self) -> str:
+        """Generate the plan-vs-actual evening report (the /report command).
+
+        Grounded in the analyzer report plus today's *user-logged* material:
+        nutrition totals, training-plan adherence, hydration and the
+        structured Telegram health events (meals logged/skipped, water,
+        workouts done). Like recent_feedback in chat, these are the user's own
+        log entries — raw Garmin rows still never leave the analyzer.
+        """
+        today = date.today().isoformat()
+        last_plan = self.db.last_plan()
+        context = {
+            "analysis": self.analyzer.report(),
+            "todays_morning_plan": (
+                last_plan if last_plan and last_plan.get("day") == today else None
+            ),
+            "training_plans_today": self.db.get_today_training_plans(),
+            "nutrition_today": self.db.nutrition_summary(day=today),
+            "hydration_today": self.db.recent_hydration(days=1),
+            "health_events_today": self.db.health_events_for_day(today),
+            "recent_feedback": self.db.recent_feedback(days=1),
+        }
+        messages = [
+            {"role": "system", "content": self._system_prompt()},
+            {
+                "role": "user",
+                "content": (
+                    "Here is my health data, today's plan and what I logged "
+                    f"today:\n\n{as_json(context)}\n\n{_EVENING_INSTRUCTION}"
+                ),
+            },
+        ]
+        report = self._complete(messages, max_tokens=600)
+        # Seed conversation memory so follow-up chat can discuss the report.
+        self.db.add_message("assistant", report)
+        log.info("Generated evening report (%d chars).", len(report))
+        return report
 
     def chat(self, user_message: str) -> str:
         """Answer a free-text question grounded in data + conversation memory."""

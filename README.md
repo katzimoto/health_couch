@@ -57,10 +57,12 @@ health_couch/
 │   ├── database.py           # upserts, daily_summary view, memory
 │   ├── garmin_client.py      # daily pull + backfill
 │   ├── analysis.py           # trends + flags
-│   ├── coach.py              # OpenAI: daily plan + chat
-│   ├── telegram_bot.py       # two-way coach, feedback capture
+│   ├── coach.py              # OpenAI: daily plan + evening report + chat
+│   ├── telegram_bot.py       # two-way coach, feedback + health-event capture
+│   ├── reminders.py          # Telegram reminder engine (recurrence + CRUD)
+│   ├── telegram_sender.py    # one-shot Bot API sends (reminders, MCP tool)
 │   ├── mcp_server.py         # FastMCP tools for ChatGPT
-│   ├── scheduler.py          # daily pull + 07:30 plan
+│   ├── scheduler.py          # daily pull + 07:30 plan + reminder dispatch
 │   ├── webapp.py             # Starlette web dashboard + JSON API
 │   └── web/                  # dashboard page, styles, SVG-chart JS
 └── scripts/
@@ -122,7 +124,23 @@ docker compose run --rm telegram python scripts/get_chat_id.py
 docker compose up -d telegram
 ```
 You'll get a plan at 07:30 daily. Message the bot anytime; use `/status`,
-`/plan`, and `/done` `/skipped` `/felt <note>` to log feedback.
+`/plan`, `/report`, and `/done` `/skipped` `/felt <note>` to log feedback.
+
+### 7. Telegram reminders (managed by ChatGPT)
+
+ChatGPT can schedule Telegram nudges through the connector — ask it to
+"install the default health reminders" (morning plan 08:00, lunch log 13:00,
+dinner log 20:00, evening report 21:30, local time) or to create custom ones
+(`create_telegram_reminder`: once / daily / weekly / weekdays / RRULE).
+The scheduler container delivers them; replies are captured as structured
+health events ChatGPT can read back (`get_health_events`):
+
+- `/meal <description>` (or just send a photo) — logs a meal
+- `/skipped lunch|dinner` — records the skipped meal
+- `/water 500` — adds to today's hydration total
+- `/done workout` — marks today's planned workout done
+- `/reminders`, `/edit_reminder <id> <field> <value>`, `/pause_reminder <id>`,
+  `/resume_reminder <id>`, `/delete_reminder <id>` — manage reminders in-chat
 
 ---
 

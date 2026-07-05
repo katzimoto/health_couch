@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -28,7 +28,9 @@ from .config import settings
 from .database import Database
 from .garmin_client import GarminClient
 from .heartbeat import beat
+from .reminders import Reminders, as_utc
 from .telegram_bot import TelegramCoach
+from .telegram_sender import send_telegram_message
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +51,7 @@ class SchedulerService:
         self.db = db or Database()
         self.garmin = GarminClient(self.db)
         self.telegram = TelegramCoach(self.db)
+        self.reminders = Reminders(self.db)
 
     def daily_pull(self) -> None:
         """Refresh yesterday and today, then heal a slice of any history gap."""
@@ -112,6 +115,53 @@ class SchedulerService:
                     await asyncio.sleep(_PLAN_RETRY_DELAYS_S[attempt - 1])
         log.error("Morning plan not delivered after %d attempts.", attempts)
 
+    async def reminders_job(self) -> None:
+        """Poll for due Telegram reminders once a minute and deliver them.
+
+        Runs the blocking work (SQLite + Telegram HTTP) in a worker thread so
+        the event loop's other jobs never stall behind a slow send.
+        """
+        try:
+            await asyncio.to_thread(self.dispatch_due_reminders)
+        except Exception:  # noqa: BLE001 — one bad tick must not kill the job
+            log.exception("Reminder dispatch failed (next poll in a minute).")
+
+    def dispatch_due_reminders(self) -> None:
+        """Send every due reminder; failure policy per reminder:
+
+        * within the grace window a failed send keeps ``next_run_at`` in
+          place, so the next minute's poll retries;
+        * past the grace window (persistent failure, or the container was
+          down) the firing is recorded as *missed* and the schedule advances
+          — no flood of stale reminders on recovery.
+
+        Every outcome lands in telegram_reminder_delivery, so failures are
+        visible in the data as well as the logs.
+        """
+        now = datetime.now(timezone.utc)
+        for reminder in self.reminders.due(now):
+            overdue = now - as_utc(reminder["next_run_at"])
+            if overdue > Reminders.SEND_GRACE:
+                log.warning(
+                    "Reminder %s (%r) missed its window by %s — skipping to "
+                    "the next occurrence.",
+                    reminder["id"], reminder["title"], overdue,
+                )
+                self.reminders.mark_missed(reminder["id"], now=now)
+                continue
+            try:
+                message_id = send_telegram_message(reminder["message"])
+            except Exception as exc:  # noqa: BLE001 — record + retry next poll
+                log.exception(
+                    "Reminder %s (%r) failed to send — will retry for %s.",
+                    reminder["id"], reminder["title"],
+                    Reminders.SEND_GRACE - overdue,
+                )
+                self.reminders.mark_failed(reminder["id"], str(exc))
+                continue
+            self.reminders.mark_sent(reminder["id"], message_id, now=now)
+            log.info("Sent reminder %s (%r).", reminder["id"], reminder["title"])
+
     def backup_db(self) -> None:
         """Nightly online backup of the SQLite file, keeping the newest few."""
         backups = Path(settings.db_path).expanduser().parent / "backups"
@@ -162,6 +212,18 @@ class SchedulerService:
             CronTrigger(hour=3, minute=0, timezone=settings.timezone),
             id="db_backup",
             replace_existing=True,
+        )
+        # Reminder delivery needs minute resolution — reminders fire at
+        # arbitrary HH:MM in arbitrary timezones, so a fixed cron can't cover
+        # them; a cheap due-row query runs every minute instead.
+        scheduler.add_job(
+            self.reminders_job,
+            "interval",
+            minutes=1,
+            id="telegram_reminders",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
         )
         scheduler.add_job(
             lambda: beat("scheduler"),
