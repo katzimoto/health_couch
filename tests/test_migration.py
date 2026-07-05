@@ -256,6 +256,62 @@ def test_schema_init_never_destroys_existing_data(tmp_path) -> None:
     assert db.pulled_days("2026-07-01", "2026-07-01") == {"2026-07-01"}
 
 
+def _make_legacy_workout_and_plan_tables(path: str) -> None:
+    """Shapes as they existed before start_time/meta_json (workout) and
+    updated_at (training_plan) — the top-5-features migration's target."""
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """CREATE TABLE workout (
+               activity_id INTEGER PRIMARY KEY,
+               day VARCHAR NOT NULL,
+               name VARCHAR, type VARCHAR, duration_s FLOAT,
+               distance_m FLOAT, calories INTEGER, avg_hr INTEGER, max_hr INTEGER,
+               training_load FLOAT, source VARCHAR, load_source VARCHAR,
+               duplicate_of INTEGER, updated_at DATETIME NOT NULL
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO workout (activity_id, day, name, type, training_load, updated_at) "
+        "VALUES (777, '2026-06-30', 'Legacy lift', 'strength_training', 40.0, '2026-06-30 12:00:00')"
+    )
+    conn.execute(
+        """CREATE TABLE training_plan (
+               id INTEGER PRIMARY KEY, day VARCHAR NOT NULL, ts DATETIME NOT NULL,
+               title VARCHAR, goal VARCHAR, planned_start_time VARCHAR,
+               estimated_duration_s FLOAT, workout_type VARCHAR, exercises VARCHAR,
+               cardio_plan VARCHAR, intensity_target VARCHAR, notes VARCHAR,
+               status VARCHAR NOT NULL, feedback VARCHAR, actual_duration_s FLOAT,
+               difficulty_rpe FLOAT, skip_reason VARCHAR
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO training_plan (day, ts, title, status) "
+        "VALUES ('2026-06-30', '2026-06-30 08:00:00', 'Legacy plan', 'planned')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_migration_adds_workout_and_training_plan_columns(tmp_path) -> None:
+    path = str(tmp_path / "legacy_workout.db")
+    _make_legacy_workout_and_plan_tables(path)
+    db = Database(path=path)
+
+    workout = db.recent_workouts(days=10_000)[0]
+    assert workout["start_time"] is None and workout["meta_json"] is None
+    assert workout["training_load"] == 40.0  # pre-existing data untouched
+
+    plan = db.get_training_plans(days=10_000)[0]
+    assert plan["updated_at"] is None
+    assert plan["title"] == "Legacy plan"
+
+    # And the new features work against the healed schema.
+    updated = db.update_training_plan(plan["id"], title="Legacy plan (adjusted)")
+    assert updated["updated_at"] is not None
+    merge_result = db.merge_garmin_strength_fragments("2026-06-30")
+    assert merge_result["merged"] is False  # only one fragment — nothing to merge
+
+
 def test_meal_logging_with_and_without_macros(tmp_path) -> None:
     db = Database(path=str(tmp_path / "fresh.db"))
     db.add_meal(name="calorie only", day="2026-07-04", calories=500)

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
@@ -34,16 +35,27 @@ from .analysis import Analyzer
 from .config import settings
 from .database import Database, synthetic_activity_id as _synthetic_activity_id
 from .garmin_client import GarminClient
+from .nutrition_gaps import (
+    DEFAULT_TIMEZONE as NUTRITION_TIMEZONE,
+    categorize_meals,
+    missing_meals as _missing_meals,
+    recommend_next_meal,
+    sugar_status,
+    workout_meal_flags,
+)
 from .progression import recommend_next_weight, recovery_caution
 from .reminders import DEFAULT_TIMEZONE, Reminders
 from .telegram_sender import send_telegram_message
 from .training_load import estimate_training_load
+from .workout_flow import WorkoutLogFlows
+from .workout_reminders import REMINDER_TYPES, compute_reminder_pack_times
 
 log = logging.getLogger("garmin_coach.mcp")
 
 db = Database()
 analyzer = Analyzer(db)
 reminders = Reminders(db)
+workout_log_flows = WorkoutLogFlows(db)
 
 
 def _build_server() -> FastMCP:
@@ -637,6 +649,54 @@ def create_training_plan(
 
 
 @mcp.tool
+def update_training_plan(
+    plan_id: int,
+    day: str | None = None,
+    title: str | None = None,
+    goal: str | None = None,
+    planned_start_time: str | None = None,
+    estimated_duration_s: float | None = None,
+    workout_type: str | None = None,
+    exercises: list[dict] | None = None,
+    cardio_plan: str | None = None,
+    intensity_target: str | None = None,
+    notes: str | None = None,
+    status: str | None = None,
+) -> dict:
+    """Partially update an existing training plan — reduce sets, change the
+    workout time, replace exercises, tighten intensity, or mark it adjusted
+    for recovery, without recreating it. Only provided fields change; the
+    rest of the plan is preserved. ``status`` (if given) must be one of
+    planned|done|skipped|partially_done. Every changed field is recorded in
+    the plan's edit history and ``updated_at`` is bumped. Returns the full
+    updated plan, or an error if ``plan_id`` doesn't exist or ``status`` is
+    invalid."""
+    try:
+        updated = db.update_training_plan(
+            plan_id, day=day, title=title, goal=goal,
+            planned_start_time=planned_start_time,
+            estimated_duration_s=estimated_duration_s,
+            workout_type=workout_type, exercises=exercises,
+            cardio_plan=cardio_plan, intensity_target=intensity_target,
+            notes=notes, status=status,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return updated or {"error": f"no training plan with id {plan_id}"}
+
+
+@mcp.tool
+def get_training_plan(plan_id: int) -> dict:
+    """A single training plan by id, including its edit history (what
+    changed and when)."""
+    plan = db.get_training_plan(plan_id)
+    if plan is None:
+        return {"error": f"no training plan with id {plan_id}"}
+    plan["history"] = db.training_plan_history(plan_id)
+    return plan
+
+
+@mcp.tool
 def get_today_plan() -> list[dict]:
     """Today's planned workout(s) with status (planned / done / skipped /
     partially_done). Empty list if nothing is planned."""
@@ -687,6 +747,151 @@ def log_plan_feedback(plan_id: int, feedback: str) -> dict:
     return updated or {"error": f"no training plan with id {plan_id}"}
 
 
+# ── Workout reminder packs ───────────────────────────────────────────────────────
+
+_REMINDER_PACK_TAG = "workout_reminder_pack"
+
+# (title, message template — {title} is the plan's title, {time} its HH:MM start)
+_REMINDER_PACK_COPY: dict[str, tuple[str, str]] = {
+    "pre_workout_meal": (
+        "Pre-workout meal",
+        "Eat a pre-workout meal before {title} at {time}.",
+    ),
+    "hydration": (
+        "Hydration",
+        "Hydrate before {title} at {time} — water/electrolytes now.",
+    ),
+    "gym_start": ("Workout time", "Time to start: {title}."),
+    "post_workout_meal": (
+        "Post-workout meal",
+        "Eat your post-workout meal — protein + carbs to kick off recovery.",
+    ),
+    "workout_log": (
+        "Log your workout",
+        "Log how {title} went (sets/reps/RPE) so tomorrow's plan can adjust.",
+    ),
+}
+
+
+def _linked_reminders_by_type(plan_id: int) -> dict[str, dict]:
+    """Non-deleted reminders previously created by this tool for ``plan_id``,
+    keyed by reminder type — one list scan instead of one per type."""
+    out: dict[str, dict] = {}
+    for r in reminders.list():
+        meta = r.get("metadata") or {}
+        if meta.get("plan_id") == plan_id and meta.get("reminder_type"):
+            out[meta["reminder_type"]] = r
+    return out
+
+
+@mcp.tool
+def create_workout_reminder_pack(
+    plan_id: int,
+    workout_time: str | None = None,
+    timezone: str = DEFAULT_TIMEZONE,
+    date: str | None = None,
+    include_pre_workout_meal: bool = True,
+    include_hydration: bool = True,
+    include_gym_start: bool = True,
+    include_post_workout_meal: bool = True,
+    include_workout_log: bool = True,
+) -> dict:
+    """Create a linked pack of one-off Telegram reminders around a planned
+    workout: pre-workout meal (90-150 min before), hydration (30-45 min
+    before), gym/workout start (at the workout time), post-workout meal
+    (45-90 min after the expected end) and a workout-log nudge (after the
+    expected end). ``estimated_duration_s`` from the plan sizes the "expected
+    end" (default 60 min if the plan doesn't have one).
+
+    ``workout_time`` defaults to the plan's ``planned_start_time`` and
+    ``date`` to the plan's day — pass them to override. Idempotent: calling
+    this again for the same plan reuses (and resyncs the time of) the
+    reminders already linked to it via metadata instead of duplicating them.
+    Toggle the ``include_*`` flags to build a partial pack. Returns an error
+    naming the missing field if no workout time can be determined."""
+    plan = db.get_training_plan(plan_id)
+    if plan is None:
+        return {"error": f"no training plan with id {plan_id}"}
+    workout_date = date or plan.get("day")
+    if not workout_date:
+        return {"error": "no workout date — the plan has no day and none was provided"}
+    time_str = workout_time or plan.get("planned_start_time")
+    if not time_str:
+        return {
+            "error": "workout_time is required — the plan has no planned_start_time; "
+                     "pass workout_time (HH:MM)."
+        }
+    included = {
+        "pre_workout_meal": include_pre_workout_meal,
+        "hydration": include_hydration,
+        "gym_start": include_gym_start,
+        "post_workout_meal": include_post_workout_meal,
+        "workout_log": include_workout_log,
+    }
+    wanted_types = [t for t in REMINDER_TYPES if included[t]]
+    try:
+        times = compute_reminder_pack_times(
+            workout_date, time_str, plan.get("estimated_duration_s")
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    title = plan.get("title") or "your workout"
+    linked = _linked_reminders_by_type(plan_id)
+    results: list[dict] = []
+    for reminder_type in wanted_types:
+        r_date, r_time = times[reminder_type]
+        heading, message_tpl = _REMINDER_PACK_COPY[reminder_type]
+        message = message_tpl.format(title=title, time=time_str)
+        metadata = {
+            "plan_id": plan_id, "reminder_type": reminder_type,
+            "workout_date": workout_date, "workout_time": time_str,
+        }
+        existing = linked.get(reminder_type)
+        if existing is not None:
+            in_sync = existing["time"] == r_time and existing["date"] == r_date
+            reminder = existing if in_sync else reminders.edit(
+                existing["id"], time=r_time, date=r_date, message=message
+            )
+            results.append({
+                "type": reminder_type, "time": r_time,
+                "reminder_id": reminder["id"], "deduplicated": True,
+                "_metadata": reminder.get("metadata") or {},
+            })
+            continue
+        created = reminders.create(
+            title=heading, message=message, time=r_time, timezone=timezone,
+            recurrence="once", date=r_date,
+            tags=[_REMINDER_PACK_TAG, reminder_type], metadata=metadata,
+        )
+        results.append({
+            "type": reminder_type, "time": r_time,
+            "reminder_id": created["id"],
+            "deduplicated": created.get("deduplicated", False),
+            "_metadata": created.get("metadata") or {},
+        })
+
+    # Cross-reference the whole pack on each reminder so any one of them
+    # identifies its siblings — skip the write when it's already correct
+    # (the common case on an idempotent re-run).
+    all_ids = [r["reminder_id"] for r in results]
+    for r in results:
+        if sorted(r["_metadata"].get("reminder_pack_ids") or []) == sorted(all_ids):
+            continue
+        reminders.edit(r["reminder_id"], metadata={
+            "plan_id": plan_id, "reminder_type": r["type"],
+            "workout_date": workout_date, "workout_time": time_str,
+            "reminder_pack_ids": all_ids,
+        })
+    for r in results:
+        del r["_metadata"]
+
+    return {
+        "plan_id": plan_id, "date": workout_date, "workout_time": time_str,
+        "reminders": results,
+    }
+
+
 # ── Nutrition summary ───────────────────────────────────────────────────────────
 
 @mcp.tool
@@ -697,6 +902,106 @@ def get_nutrition_summary(days: int = 7, day: str | None = None) -> list[dict]:
     next today?'. Meals logged without macros contribute only what they
     carry."""
     return db.nutrition_summary(days=max(1, min(days, 90)), day=day)
+
+
+@mcp.tool
+def get_nutrition_gaps(day: str | None = None) -> dict:
+    """What's still needed today: remaining calories/macros vs profile
+    targets, which of breakfast/lunch/dinner haven't been logged (only once
+    their time window has started, and never counted as "missing" if the
+    user explicitly logged a skipped-meal event instead), whether a
+    pre/post-workout meal is missing around today's planned workout, and a
+    concrete suggestion for what to eat next. ``day`` defaults to today in
+    Asia/Jerusalem. Unset profile targets show up as ``null``, not zero."""
+    tz = ZoneInfo(NUTRITION_TIMEZONE)
+    now_local = datetime.now(tz)
+    today_str = now_local.date().isoformat()
+    target_day = day or today_str
+
+    # nutrition_summary already carries calorie/protein targets and their
+    # remaining amounts (it reads the same profile) — reuse those instead of
+    # re-deriving them; only carbs/fat/fiber need a fresh profile read here.
+    summary = db.nutrition_summary(day=target_day)[0]
+    profile = db.get_profile() or {}
+    targets = {
+        "calories": summary["calorie_target"],
+        "protein_g": summary["protein_target_g"],
+        "carbs_g": profile.get("carbs_target_g"),
+        "fat_g": profile.get("fat_target_g"),
+        "fiber_g": profile.get("fiber_target_g"),
+    }
+    consumed = {
+        "calories": summary["total_calories"],
+        "protein_g": summary["total_protein_g"],
+        "carbs_g": summary["total_carbs_g"],
+        "fat_g": summary["total_fat_g"],
+        "fiber_g": summary["total_fiber_g"],
+    }
+
+    def remaining(key: str) -> float | None:
+        target = targets[key]
+        if target is None:
+            return None
+        return round(target - (consumed[key] or 0), 1)
+
+    remaining_ = {
+        "calories": summary["calories_remaining"],
+        "protein_g": summary["protein_remaining_g"],
+        "carbs_g": remaining("carbs_g"),
+        "fat_g": remaining("fat_g"),
+        "fiber_g": remaining("fiber_g"),
+    }
+
+    events = db.health_events_for_day(target_day)
+    skipped = {
+        (e.get("payload") or {}).get("meal") for e in events if e["kind"] == "skipped_meal"
+    }
+    skipped.discard(None)
+    meals = db.meals_for_day(target_day)
+    logged = categorize_meals(meals)
+
+    if target_day < today_str:
+        effective_now = now_local.replace(hour=23, minute=59)  # a past day — all windows elapsed
+    elif target_day > today_str:
+        effective_now = now_local.replace(hour=0, minute=0)  # a future day — nothing due yet
+    else:
+        effective_now = now_local
+    missing = _missing_meals(logged, skipped, effective_now)
+
+    workout_time = None
+    estimated_duration_s = None
+    if target_day == today_str:
+        plans_today = [p for p in db.get_training_plans_for_day(target_day) if p["status"] == "planned"]
+        if plans_today:
+            workout_time = plans_today[0].get("planned_start_time")
+            estimated_duration_s = plans_today[0].get("estimated_duration_s")
+    flags = workout_meal_flags(workout_time, estimated_duration_s, meals, now_local, NUTRITION_TIMEZONE)
+
+    alerts: list[str] = []
+    if remaining_["protein_g"] is not None and remaining_["protein_g"] > 20:
+        alerts.append("Protein is behind target.")
+    if remaining_["fiber_g"] is not None and remaining_["fiber_g"] > 10:
+        alerts.append("Fiber is low.")
+    for name in missing:
+        alerts.append(f"{name.capitalize()} not logged.")
+    if flags["pre_workout_meal_missing"]:
+        alerts.append("Pre-workout meal not logged.")
+    if flags["post_workout_meal_missing"]:
+        alerts.append("Post-workout meal not logged.")
+
+    return {
+        "day": target_day,
+        "targets": targets,
+        "consumed": {**consumed, "sugar_g": summary["total_sugar_g"]},
+        "remaining": remaining_,
+        "sugar_status": sugar_status(summary["total_sugar_g"]),
+        "meal_count": summary["meal_count"],
+        "missing_meals": missing,
+        "pre_workout_meal_missing": flags["pre_workout_meal_missing"],
+        "post_workout_meal_missing": flags["post_workout_meal_missing"],
+        "alerts": alerts,
+        "recommended_next_meal": recommend_next_meal(remaining_),
+    }
 
 
 # ── Meal / workout corrections ──────────────────────────────────────────────────
@@ -798,6 +1103,31 @@ def set_activity_source_priority(priority: list[str]) -> dict:
     e.g. ["garmin", "apple", "manual"]."""
     profile = db.set_profile(activity_source_priority=",".join(priority))
     return {"activity_source_priority": profile["activity_source_priority"]}
+
+
+@mcp.tool
+def merge_garmin_strength_fragments(
+    day: str,
+    dry_run: bool = False,
+    min_fragments: int = 2,
+    max_gap_minutes: float = 90.0,
+) -> dict:
+    """Merge same-day Garmin strength-training fragments (the watch
+    sometimes records one gym session as several short activities) into one
+    canonical workout, so training load and recovery flags aren't inflated
+    by double-counting. Only ``source="garmin"`` activities of a
+    strength-like type are considered; manual logs and already-merged rows
+    are untouched. Set ``dry_run=true`` to preview the effect without
+    changing data. Originals are never deleted — they're marked
+    ``duplicate_of`` the merged row (same mechanism as dedupe_workouts), so
+    they drop out of summaries/training load/workout counts but stay in the
+    database. Idempotent: re-running for the same day updates the existing
+    merged row instead of creating another one."""
+    return db.merge_garmin_strength_fragments(
+        day, dry_run=dry_run,
+        min_fragments=max(1, min_fragments),
+        max_gap_minutes=max(1.0, max_gap_minutes),
+    )
 
 
 # ── Readiness check-in ──────────────────────────────────────────────────────────
@@ -1056,6 +1386,41 @@ def get_health_events(days: int = 7, kind: str | None = None) -> list[dict]:
     reports — they are the ground truth of what the user actually did between
     reminders. Filter with ``kind``."""
     return db.recent_health_events(days=max(1, min(days, 365)), kind=kind)
+
+
+# ── Telegram workout-completion flow ─────────────────────────────────────────────
+
+@mcp.tool
+def start_workout_log_flow(
+    plan_id: int, reminder_id: int | None = None, timezone: str = DEFAULT_TIMEZONE
+) -> dict:
+    """Start the interactive Telegram flow that walks the user through
+    logging a finished (or skipped) workout: did you complete it, how long
+    did it take, then per-exercise sets/reps/weight/RPE/pain — accepting
+    free text and tolerating partial replies. Pushes the first question to
+    Telegram now; the user's subsequent replies continue the flow (/cancel,
+    /skip, /done are recognised at any step) until it logs the session
+    (via the same paths as log_strength_session / mark_plan_done /
+    mark_plan_skipped) and sends a final confirmation there. Idempotent:
+    calling this again for a plan that already has an open flow resumes it
+    instead of starting a second, conflicting conversation."""
+    try:
+        started = workout_log_flows.start(plan_id, reminder_id=reminder_id, timezone=timezone)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if not started["reused"]:
+        try:
+            send_telegram_message(started["prompt"])
+        except Exception as exc:  # noqa: BLE001 — surface, the flow row still exists
+            log.exception("Failed to push workout-log flow prompt")
+            return {
+                "error": f"flow started but the Telegram push failed: {exc}",
+                "flow_id": started["flow_id"],
+            }
+    return {
+        "plan_id": plan_id, "flow_id": started["flow_id"],
+        "prompt": started["prompt"], "reused": started["reused"],
+    }
 
 
 def main() -> None:

@@ -31,6 +31,7 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -42,6 +43,7 @@ from .config import settings
 from .database import Database
 from .heartbeat import beat
 from .reminders import Reminders
+from .workout_flow import WorkoutLogFlows
 
 log = logging.getLogger("garmin_coach.telegram")
 
@@ -53,6 +55,7 @@ class TelegramCoach:
         self.db = db or Database()
         self.coach = Coach(self.db)
         self.reminders = Reminders(self.db)
+        self.workout_flows = WorkoutLogFlows(self.db)
         self._allowed = settings.telegram_chat_id.strip()
 
     # ── Guards ─────────────────────────────────────────────────────────────────
@@ -362,6 +365,47 @@ class TelegramCoach:
             reply = "⚠️ Something went wrong. Check the server logs."
         await update.message.reply_text(reply)
 
+    # ── Workout-completion flow ────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_flow_result(result: dict) -> str:
+        if result.get("cancelled"):
+            return "❎ Cancelled — nothing was logged."
+        if result.get("status") == "skipped":
+            reason = result.get("skip_reason")
+            return "📝 Marked skipped." + (f" Reason: {reason}" if reason else "")
+        lines = [f"✅ Workout logged — status: {result.get('status')}."]
+        if result.get("duration_s"):
+            lines.append(f"Duration: {round(result['duration_s'] / 60)} min")
+        if result.get("exercises_logged"):
+            lines.append(f"Exercises logged: {result['exercises_logged']}")
+        if result.get("notes"):
+            lines.append(f"Notes: {result['notes']}")
+        if result.get("next_step"):
+            lines.append(result["next_step"])
+        return "\n".join(lines)
+
+    async def route_active_flow(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Runs ahead of every other handler (registered in an earlier
+        group): while a workout-log flow is open, every reply — including
+        /cancel, /skip, /done, which would otherwise hit unrelated command
+        handlers — is routed into the flow instead of its normal meaning.
+        """
+        if not self._authorized(update):
+            return  # let the normal handler for this update issue the denial
+        if not update.message or update.message.text is None:
+            return
+        flow = await asyncio.to_thread(self.workout_flows.active_flow)
+        if flow is None:
+            return
+        outcome = await asyncio.to_thread(
+            self.workout_flows.handle_reply, flow["id"], update.message.text
+        )
+        await update.message.reply_text(outcome["reply"])
+        if outcome.get("finished") and outcome.get("result"):
+            await update.message.reply_text(self._format_flow_result(outcome["result"]))
+        raise ApplicationHandlerStop
+
     # ── Push + run ─────────────────────────────────────────────────────────────
 
     async def push_morning_plan(self, app: Application | None = None) -> None:
@@ -403,6 +447,10 @@ class TelegramCoach:
             .post_init(self._post_init)
             .build()
         )
+        # Runs before every other handler so an open workout-log flow can
+        # claim /cancel, /skip, /done and any free text before their normal
+        # (unrelated) meaning would otherwise apply.
+        app.add_handler(MessageHandler(filters.TEXT, self.route_active_flow), group=-1)
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("plan", self.plan))
         app.add_handler(CommandHandler("report", self.report))

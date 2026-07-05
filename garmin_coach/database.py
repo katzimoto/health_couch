@@ -24,7 +24,7 @@ import json
 import logging
 import sqlite3
 import time as _time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -57,9 +57,11 @@ from .models import (
     StrengthSession,
     Stress,
     TrainingPlan,
+    TrainingPlanEdit,
     Vital,
     Weight,
     Workout,
+    WorkoutLogFlow,
 )
 from .training_load import estimate_training_load
 
@@ -881,28 +883,83 @@ class Database:
             rows = s.exec(stmt).all()
         return [self._plan_dict(r) for r in rows]
 
-    def get_today_training_plans(self) -> list[dict[str, Any]]:
-        today = date.today().isoformat()
+    def get_training_plans_for_day(self, day: str | date) -> list[dict[str, Any]]:
+        day_str = _as_day(day)
         with self.session() as s:
             rows = s.exec(
                 select(TrainingPlan)
-                .where(TrainingPlan.day == today)
+                .where(TrainingPlan.day == day_str)
                 .order_by(TrainingPlan.id)
             ).all()
         return [self._plan_dict(r) for r in rows]
 
+    def get_today_training_plans(self) -> list[dict[str, Any]]:
+        return self.get_training_plans_for_day(date.today())
+
+    def get_training_plan(self, plan_id: int) -> dict[str, Any] | None:
+        with self.session() as s:
+            row = s.get(TrainingPlan, plan_id)
+            return self._plan_dict(row) if row is not None else None
+
+    _PLAN_STATUSES = {"planned", "done", "skipped", "partially_done"}
+
     def update_training_plan(self, plan_id: int, **fields: Any) -> dict[str, Any] | None:
+        """Partial update. Only non-``None`` fields change; a changed field is
+        recorded in ``training_plan_edit`` and ``updated_at`` is bumped. Raises
+        ``ValueError`` for an unrecognised ``status``."""
+        status = fields.get("status")
+        if status is not None and status not in self._PLAN_STATUSES:
+            raise ValueError(
+                f"status must be one of {sorted(self._PLAN_STATUSES)}, got {status!r}"
+            )
+        exercises = fields.pop("exercises", None)
+        if isinstance(exercises, (list, dict)):
+            fields["exercises"] = json.dumps(exercises, ensure_ascii=False)
+        elif exercises is not None:
+            fields["exercises"] = exercises
+
         with self.session() as s:
             row = s.get(TrainingPlan, plan_id)
             if row is None:
                 return None
+            changes: dict[str, Any] = {}
             for key, value in fields.items():
-                if value is not None:
-                    setattr(row, key, value)
+                if value is None:
+                    continue
+                old = getattr(row, key, None)
+                if old != value:
+                    changes[key] = {"old": old, "new": value}
+                setattr(row, key, value)
+            if changes:
+                row.updated_at = datetime.now(timezone.utc)
+                s.add(
+                    TrainingPlanEdit(
+                        plan_id=plan_id,
+                        changes_json=json.dumps(changes, ensure_ascii=False, default=str),
+                    )
+                )
             s.add(row)
             s.commit()
             s.refresh(row)
             return self._plan_dict(row)
+
+    def training_plan_history(self, plan_id: int) -> list[dict[str, Any]]:
+        """Audit trail of changes applied via update_training_plan, oldest first."""
+        with self.session() as s:
+            rows = s.exec(
+                select(TrainingPlanEdit)
+                .where(TrainingPlanEdit.plan_id == plan_id)
+                .order_by(TrainingPlanEdit.id)
+            ).all()
+        out = []
+        for r in rows:
+            entry = r.model_dump()
+            try:
+                entry["changes"] = json.loads(entry.pop("changes_json"))
+            except ValueError:
+                entry["changes"] = {}
+            out.append(entry)
+        return out
 
     # ── Meals: partial update / delete ─────────────────────────────────────────
 
@@ -1088,7 +1145,10 @@ class Database:
 
     # ── Workout deduplication ──────────────────────────────────────────────────
 
-    _DEFAULT_SOURCE_PRIORITY = ("garmin", "apple", "manual")
+    # garmin_merged ranks above plain garmin: it's a deliberately curated
+    # canonical session, so a same-day Apple/manual import that looks like a
+    # duplicate must never win against it and hide the merged summary.
+    _DEFAULT_SOURCE_PRIORITY = ("garmin_merged", "garmin", "apple", "manual")
 
     def _source_priority(self) -> list[str]:
         profile = self.get_profile() or {}
@@ -1188,6 +1248,133 @@ class Database:
                     )
             s.commit()
         return {"groups_found": len(groups), "marked": marked, "priority": priority}
+
+    # ── Garmin strength-fragment merging ────────────────────────────────────────
+
+    def merge_garmin_strength_fragments(
+        self,
+        day: str | date,
+        dry_run: bool = False,
+        min_fragments: int = 2,
+        max_gap_minutes: float = 90.0,
+    ) -> dict[str, Any]:
+        """Merge same-day Garmin strength-training fragments into one
+        canonical workout so training load/recovery math isn't inflated by
+        a session the watch recorded as several short activities.
+
+        Only ``source="garmin"`` activities of a strength-like type are
+        considered — manual logs and already-merged rows are untouched.
+        Originals are never deleted: they're marked ``duplicate_of`` the
+        merged row (the same mechanism ``dedupe_workouts`` uses), so
+        summaries/training load/workout counts see the session once while
+        the raw Garmin rows stay in the database. Re-running for the same
+        day (dry_run or not) is idempotent — it recomputes and updates the
+        existing merged row instead of creating a second one.
+        """
+        from .strength_merge import group_fragments, is_strength_like, weighted_avg_hr
+
+        day_str = _as_day(day)
+        with self.session() as s:
+            # Not filtered by duplicate_of: a fragment already merged (by an
+            # earlier call, for idempotency) must still be found so it can be
+            # regrouped and re-matched to its existing merged row.
+            rows = s.exec(
+                select(Workout)
+                .where(Workout.day == day_str)
+                .where(Workout.source == "garmin")
+            ).all()
+            fragments = [r.model_dump() for r in rows if is_strength_like(r.type)]
+
+        if len(fragments) < max(1, min_fragments):
+            return {
+                "day": day_str, "dry_run": dry_run, "merged": False,
+                "reason": (
+                    f"found {len(fragments)} strength fragment(s) — need at "
+                    f"least {min_fragments} to merge"
+                ),
+                "fragment_ids": sorted(f["activity_id"] for f in fragments),
+            }
+
+        groups = group_fragments(fragments, max_gap_minutes=max_gap_minutes)
+        mergeable = [g for g in groups if len(g) >= min_fragments]
+        if not mergeable:
+            return {
+                "day": day_str, "dry_run": dry_run, "merged": False,
+                "reason": "fragments are too far apart in time to be one session",
+                "groups": [sorted(f["activity_id"] for f in g) for g in groups],
+            }
+        group = max(mergeable, key=len)
+
+        before_load = round(sum(f.get("training_load") or 0 for f in group), 1)
+        total_duration = sum(f.get("duration_s") or 0 for f in group) or None
+        total_calories = round(sum(f.get("calories") or 0 for f in group)) or None
+        avg_hr = weighted_avg_hr(group)
+        max_hr = max((f["max_hr"] for f in group if f.get("max_hr")), default=None)
+        load_after = estimate_training_load("strength_training", total_duration, avg_hr=avg_hr)
+        if load_after is None:
+            load_after = before_load
+        fragment_ids = sorted(f["activity_id"] for f in group)
+
+        if dry_run:
+            return {
+                "day": day_str, "dry_run": True, "merged": False,
+                "would_merge": True,
+                "fragment_ids": fragment_ids,
+                "total_duration_s": total_duration,
+                "total_calories": total_calories,
+                "avg_hr": avg_hr,
+                "max_hr": max_hr,
+                "training_load_before": before_load,
+                "training_load_after": load_after,
+            }
+
+        with self.session() as s:
+            existing_merged = s.exec(
+                select(Workout).where(
+                    Workout.day == day_str, Workout.source == "garmin_merged"
+                )
+            ).all()
+        merged_id = None
+        for existing in existing_merged:
+            meta = json.loads(existing.meta_json) if existing.meta_json else {}
+            if sorted(meta.get("fragment_ids", [])) == fragment_ids:
+                merged_id = existing.activity_id
+                break
+        if merged_id is None:
+            merged_id = synthetic_activity_id()
+
+        self.upsert_workout(
+            merged_id, day_str,
+            name="Merged Garmin strength session",
+            type="strength_training",
+            duration_s=total_duration,
+            calories=total_calories,
+            avg_hr=avg_hr,
+            max_hr=max_hr,
+            training_load=load_after,
+            source="garmin_merged",
+            load_source="estimated",
+            meta_json=json.dumps({"fragment_ids": fragment_ids}),
+        )
+        with self.session() as s:
+            for fragment_id in fragment_ids:
+                fragment = s.get(Workout, fragment_id)
+                if fragment is not None:
+                    fragment.duplicate_of = merged_id
+                    s.add(fragment)
+            s.commit()
+
+        return {
+            "day": day_str, "dry_run": False, "merged": True,
+            "merged_activity_id": merged_id,
+            "fragment_ids": fragment_ids,
+            "total_duration_s": total_duration,
+            "total_calories": total_calories,
+            "avg_hr": avg_hr,
+            "max_hr": max_hr,
+            "training_load_before": before_load,
+            "training_load_after": load_after,
+        }
 
     # ── Backup ─────────────────────────────────────────────────────────────────
 
