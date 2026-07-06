@@ -111,10 +111,14 @@ def get_training_load(days: int = 28) -> dict:
     """EWMA-weighted acute (7d) vs chronic (28d) training load, their ratio,
     and recent workouts (duplicates excluded). Ratio >1.5 = spike, <0.8 =
     detraining. Each workout's ``load_source`` says whether its load is
-    garmin-provided, estimated (documented heuristic), or manually entered."""
+    garmin-provided, estimated (documented heuristic), or manually entered.
+    A merged workout (manual strength + Garmin activity) counts once, with the
+    Garmin load when available; ``merged_workouts`` lists these with their
+    field provenance."""
     return {
         "acute_chronic": analyzer.acute_chronic_ratio(),
         "recent_workouts": db.recent_workouts(days=days),
+        "merged_workouts": db.merged_workout_summaries(days=days),
     }
 
 
@@ -147,8 +151,12 @@ def get_flags() -> dict:
 def get_full_report() -> dict:
     """Complete analyzer report in one call: latest daily summary, 7d-vs-28d
     trends for every tracked metric (sleep, HRV, resting HR, steps, stress,
-    weight, body fat), sleep debt, acute:chronic training load, and flags."""
-    return analyzer.report()
+    weight, body fat), sleep debt, acute:chronic training load, and flags.
+    ``merged_workouts`` describes any field-level merged sessions (manual
+    exercise log + Garmin physiology) so they read as one session, not two."""
+    report = analyzer.report()
+    report["merged_workouts"] = db.merged_workout_summaries(days=28)
+    return report
 
 
 @mcp.tool
@@ -1143,6 +1151,64 @@ def merge_garmin_strength_fragments(
         day, dry_run=dry_run,
         min_fragments=max(1, min_fragments),
         max_gap_minutes=max(1.0, max_gap_minutes),
+    )
+
+
+@mcp.tool
+def merge_workout_sources(
+    day: str | None = None,
+    activity_id: int | None = None,
+    source_activity_ids: list[int] | None = None,
+    force: bool = False,
+    dry_run: bool = False,
+    min_confidence: float = 0.5,
+) -> dict:
+    """Link a manual strength log and a Garmin activity of the *same* session
+    into one canonical workout, combining them field-by-field instead of
+    hiding one: manual keeps the exercise details (names/order/sets/reps/
+    weights/RPE/notes), Garmin supplies physiology (HR, calories, duration,
+    training load, timing). Both source rows are preserved and marked
+    duplicate of the canonical, so summaries and training load count the
+    session once. Returns which fields came from which source.
+
+    Pass ``day`` (or ``activity_id``, whose day is used) to auto-match strength
+    sessions on that day; pass ``source_activity_ids`` to link specific rows
+    yourself (to override a bad auto-match). ``force`` accepts low-confidence
+    matches; ``dry_run`` previews without writing."""
+    return db.merge_workout_sources(
+        day=day, activity_id=activity_id, source_activity_ids=source_activity_ids,
+        force=force, dry_run=dry_run, min_confidence=min_confidence,
+    )
+
+
+@mcp.tool
+def get_merged_workout(activity_id: int) -> dict:
+    """Everything about one workout: the canonical summary, per-field
+    provenance (which source gave exercise details vs HR vs calories vs
+    duration vs training load), each linked source record with what it
+    contributed, the strength exercises, and the Garmin physiology fields.
+    Works on any workout — an unmerged one simply has no linked sources."""
+    result = db.get_merged_workout(activity_id)
+    return result if result is not None else {"error": f"no workout with activity_id {activity_id}"}
+
+
+@mcp.tool
+def unmerge_workout_sources(canonical_activity_id: int) -> dict:
+    """Undo a field-level merge (override a wrong match): restore each source
+    row into its own workout, reattach the strength session to its manual row,
+    and delete the canonical. No data is lost — source rows were never
+    deleted. Re-link differently with merge_workout_sources(source_activity_ids=...)."""
+    return db.unmerge_workout_sources(canonical_activity_id)
+
+
+@mcp.tool
+def backfill_workout_source_merges(days: int = 3650, min_confidence: float = 0.6) -> dict:
+    """One-off: link historical manual strength sessions to same-day Garmin
+    strength activities where confidence is high. Idempotent and non-
+    destructive (source rows are kept). Use ``min_confidence`` to tune how
+    strict the historical matching is."""
+    return db.backfill_workout_source_merges(
+        days=max(1, min(days, 36500)), min_confidence=min_confidence
     )
 
 

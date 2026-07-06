@@ -149,3 +149,52 @@ def unmark_assumed_pulled_days(conn: Connection) -> None:
     conn.exec_driver_sql(
         "DELETE FROM pull_log WHERE status = ?", (_ASSUMED_STATUS,)
     )
+
+
+def add_workout_source_link_schema(conn: Connection) -> None:
+    """Add the field-level-merge schema: the ``field_sources`` provenance
+    column on ``workout`` and the ``workout_source_link`` table.
+
+    Both are additive and guarded/idempotent. On a fresh database ``create_all``
+    has already built them in final shape (and the startup reconciler adds the
+    column), so every statement here no-ops cleanly; on an upgraded database
+    that ran old code, this fills the gap. No source rows are ever removed —
+    linking is soft (``duplicate_of`` + this table), never a delete.
+    """
+    if _table_exists(conn, "workout") and "field_sources" not in _existing_columns(
+        conn, "workout"
+    ):
+        conn.exec_driver_sql('ALTER TABLE workout ADD COLUMN "field_sources" VARCHAR')
+
+    if not _table_exists(conn, "workout_source_link"):
+        conn.exec_driver_sql(
+            """CREATE TABLE workout_source_link (
+                   id INTEGER PRIMARY KEY,
+                   canonical_activity_id INTEGER NOT NULL,
+                   source_activity_id INTEGER NOT NULL,
+                   source VARCHAR NOT NULL,
+                   match_confidence FLOAT,
+                   match_reason VARCHAR,
+                   fields_imported VARCHAR,
+                   created_at DATETIME NOT NULL,
+                   updated_at DATETIME NOT NULL
+               )"""
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX ix_workout_source_link_canonical_activity_id "
+            "ON workout_source_link (canonical_activity_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX ix_workout_source_link_source_activity_id "
+            "ON workout_source_link (source_activity_id)"
+        )
+
+
+def drop_workout_source_link_schema(conn: Connection) -> None:
+    """Downgrade: drop the link table and the provenance column."""
+    if _table_exists(conn, "workout_source_link"):
+        conn.exec_driver_sql("DROP TABLE workout_source_link")
+    if _table_exists(conn, "workout") and "field_sources" in _existing_columns(
+        conn, "workout"
+    ):
+        conn.exec_driver_sql('ALTER TABLE workout DROP COLUMN "field_sources"')

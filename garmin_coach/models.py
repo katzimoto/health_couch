@@ -100,8 +100,37 @@ class Workout(SQLModel, table=True):
     # only per-workout timestamp we have; used to group same-day strength
     # fragments that belong to one gym session. Null for manual/legacy rows.
     start_time: Optional[str] = None
-    # Free-form JSON provenance, e.g. {"fragment_ids": [...]} on a merged row.
+    # Free-form JSON provenance, e.g. {"fragment_ids": [...]} on a merged row,
+    # or {"linked": [...]} on a field-level "merged" canonical.
     meta_json: Optional[str] = None
+    # Per-field provenance JSON on a field-level "merged" canonical, e.g.
+    # {"exercise_details": "manual", "avg_hr": "garmin", "calories": "garmin"}.
+    # Null on ordinary single-source rows. See workout_merge.merge_fields.
+    field_sources: Optional[str] = None
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class WorkoutSourceLink(SQLModel, table=True):
+    """Links a source workout row (manual/garmin/apple) to the field-level
+    ``merged`` canonical it contributes to.
+
+    Row-level dedupe just points a duplicate at its keeper via
+    ``Workout.duplicate_of``; that still happens (so summaries/training load
+    count the session once), but this table additionally records *why* the two
+    were linked and *which* canonical fields each source provided — so a merge
+    is auditable, reversible (``unmerge_workout_sources``), and idempotent
+    (a repeated Garmin sync updates the existing link instead of adding one).
+    """
+
+    __tablename__ = "workout_source_link"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    canonical_activity_id: int = Field(index=True)
+    source_activity_id: int = Field(index=True)
+    source: str  # manual | garmin | apple
+    match_confidence: Optional[float] = None
+    match_reason: Optional[str] = None
+    fields_imported: Optional[str] = None  # JSON array of canonical fields
+    created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
