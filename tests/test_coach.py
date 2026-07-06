@@ -89,6 +89,48 @@ def test_reuse_today_returns_saved_plan_without_api_call(coach: Coach) -> None:
     assert coach.morning_plan(reuse_today=True) == "saved plan"
 
 
+def test_morning_plan_context_includes_freshness_and_local_data(coach: Coach) -> None:
+    # Cached-but-usable state: a stale Garmin pull plus a logged meal. The
+    # plan must still be produced, and the prompt must carry the freshness
+    # status and the local Health Coach data — never a generic fallback.
+    from datetime import datetime, timedelta, timezone
+
+    from garmin_coach.models import PullLog
+    from sqlmodel import select
+
+    coach.db.record_pull(date.today().isoformat(), {"sleep": "ok"})
+    with coach.db.session() as s:
+        row = s.exec(select(PullLog).order_by(PullLog.ts.desc()).limit(1)).first()
+        row.ts = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=300)
+        s.add(row)
+        s.commit()
+    coach.db.add_meal(name="Lunch", calories=600, protein_g=40)
+
+    fake = FakeClient([_response(json.dumps(_PLAN))])
+    coach._client = fake
+    coach.morning_plan()
+
+    user_msg = fake.calls[0]["messages"][1]["content"]
+    assert '"status": "cached"' in user_msg
+    assert '"has_usable_data": true' in user_msg
+    assert "Lunch" in user_msg  # local data reached the prompt
+
+
+def test_evening_report_produced_from_cached_data(coach: Coach) -> None:
+    # No Garmin sync at all, but a profile exists → report is still generated
+    # (does not depend on a fresh/successful Garmin sync).
+    coach.db.set_profile(goal_type="fat_loss", calorie_target=2000)
+    fake = FakeClient([_response("🌙 evening report")])
+    coach._client = fake
+
+    text = coach.evening_report()
+
+    assert text == "🌙 evening report"
+    user_msg = fake.calls[0]["messages"][1]["content"]
+    assert '"status": "none"' in user_msg
+    assert '"has_usable_data": true' in user_msg
+
+
 def test_render_plan_handles_rest_day() -> None:
     text = _render_plan(
         {

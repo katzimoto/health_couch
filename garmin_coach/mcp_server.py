@@ -24,7 +24,7 @@ public URL; ChatGPT discovers the OAuth flow automatically.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from fastmcp import FastMCP
@@ -45,6 +45,7 @@ from .nutrition_gaps import (
 )
 from .progression import recommend_next_weight, recovery_caution
 from .reminders import DEFAULT_TIMEZONE, Reminders
+from .sync_policy import classify_freshness, evaluate_sync, minutes_since as _minutes_since
 from .telegram_sender import send_telegram_message
 from .training_load import estimate_training_load
 from .workout_flow import WorkoutLogFlows
@@ -387,10 +388,6 @@ def log_apple_health_export(records: list[dict]) -> dict:
 # boots fine when Garmin auth is broken — only the sync tools then fail.
 _garmin: GarminClient | None = None
 
-# Don't re-hit ~9 Garmin endpoints because a chatty conversation asked twice;
-# the hourly scheduler sync makes anything fresher than this rarely useful.
-_SYNC_COOLDOWN_MIN = 10
-
 
 def _garmin_client() -> GarminClient:
     global _garmin
@@ -399,31 +396,40 @@ def _garmin_client() -> GarminClient:
     return _garmin
 
 
-def _minutes_since(ts: datetime | None) -> float | None:
-    if ts is None:
-        return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)  # stored as UTC
-    return round((datetime.now(timezone.utc) - ts).total_seconds() / 60, 1)
-
-
 @mcp.tool
 def sync_garmin(day: str | None = None, force: bool = False) -> dict:
     """Pull fresh data from Garmin Connect right now instead of waiting for
     the hourly sync — use before answering when get_sync_status shows stale
     data. Defaults to today; pass ``day`` (YYYY-MM-DD) to refresh a specific
-    date. Skipped if today was already synced within the last few minutes
-    unless ``force=true``. Returns per-metric results."""
+    date.
+
+    Only this Garmin *network* sync is throttled — reading Health Coach data
+    (get_full_report, get_profile, get_nutrition_summary, …) is never rate
+    limited. A refresh of today is skipped when the last pull is more recent
+    than the configured minimum interval (default 60 min; an explicit
+    ``force=true`` lowers the floor to 10 min but does not remove it). When
+    skipped it returns ``{"synced": false, "reason": "throttled_recent_sync",
+    "last_synced_at": …, "minutes_since_last_sync": …}`` — keep using the
+    cached data. An explicit ``day`` always bypasses throttling."""
     last = db.last_pull()
-    if day is None and not force and last is not None:
-        minutes_ago = _minutes_since(last["ts"])
-        if minutes_ago is not None and minutes_ago < _SYNC_COOLDOWN_MIN:
+    # An explicit historical day is a deliberate backfill — never throttled.
+    if day is None:
+        minutes_ago = _minutes_since(last["ts"]) if last else None
+        allowed, reason = evaluate_sync(
+            minutes_ago,
+            force=force,
+            default_min_interval=settings.default_min_sync_interval_minutes,
+            force_min_interval=settings.force_sync_min_interval_minutes,
+        )
+        if not allowed:
             return {
                 "synced": False,
-                "reason": f"already synced {minutes_ago:g} minutes ago — "
-                          "data is current (use force=true to override)",
-                "last_synced_day": last["day"],
+                "reason": reason,  # "throttled_recent_sync"
+                "last_synced_day": last["day"] if last else None,
+                "last_synced_at": last["ts"].isoformat() if last and last["ts"] else None,
                 "minutes_since_last_sync": minutes_ago,
+                "hint": "Data is current — keep using the cached Health Coach "
+                        "data (use force=true to override).",
             }
     target_day = day or date.today().isoformat()
     try:
@@ -432,9 +438,11 @@ def sync_garmin(day: str | None = None, force: bool = False) -> dict:
         log.exception("On-demand Garmin sync failed")
         return {
             "synced": False,
+            "reason": "sync_failed",
             "error": f"Garmin sync failed: {exc}",
             "hint": "If this persists, the cached Garmin tokens may have "
-                    "expired — run scripts/garmin_login.py on the server.",
+                    "expired — run scripts/garmin_login.py on the server. "
+                    "The cached Health Coach data is still readable.",
         }
     ok = sum(1 for status in results.values() if status == "ok")
     return {
@@ -449,22 +457,27 @@ def sync_garmin(day: str | None = None, force: bool = False) -> dict:
 @mcp.tool
 def get_sync_status() -> dict:
     """When Garmin data was last synced: the day covered, how many minutes
-    ago the sync ran, its per-metric results, and whether it's stale (the
-    scheduler syncs hourly, so >90 minutes means something is wrong). Check
-    this before trusting today's numbers; use sync_garmin to refresh."""
+    ago the sync ran, its per-metric results, and a ``freshness`` label
+    (none / fresh / cached / stale). The scheduler syncs hourly, so anything
+    but ``fresh`` (>90 min) means the newest cached data is a little old —
+    still usable. Check this before trusting today's numbers; use sync_garmin
+    to refresh. This is a local read and is never rate limited."""
     last = db.last_pull()
     if last is None:
         return {
             "synced_ever": False,
+            "freshness": "none",
             "detail": "No Garmin pull recorded yet — run a backfill or sync_garmin.",
         }
     minutes_ago = _minutes_since(last["ts"])
+    freshness = classify_freshness(minutes_ago)
     return {
         "synced_ever": True,
         "last_synced_day": last["day"],
         "last_synced_at": last["ts"].isoformat() if last["ts"] else None,
         "minutes_since_last_sync": minutes_ago,
-        "stale": minutes_ago is None or minutes_ago > 90,
+        "freshness": freshness,
+        "stale": freshness != "fresh",
         "last_results": last["status"],
     }
 

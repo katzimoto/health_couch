@@ -516,29 +516,41 @@ def test_sync_garmin_pulls_and_status_reflects_it(db: Database, monkeypatch) -> 
     assert status["last_results"] == {"sleep": "ok", "steps": "ok"}
 
 
-def test_sync_cooldown_skips_but_force_and_specific_day_override(
+def test_sync_throttle_uses_intervals_and_force_and_specific_day_override(
     db: Database, monkeypatch
 ) -> None:
     fake = _FakeGarmin(db)
     monkeypatch.setattr(mcp, "_garmin", fake)
 
-    mcp.sync_garmin()
-    repeat = mcp.sync_garmin()  # immediately again — cooldown applies
-    assert repeat["synced"] is False
-    assert "already synced" in repeat["reason"]
-    assert fake.pulled == [_day()]  # no second hit on Garmin
+    # First sync always runs (nothing pulled yet).
+    assert mcp.sync_garmin()["synced"] is True
+    assert fake.pulled == [_day()]
 
-    forced = mcp.sync_garmin(force=True)
-    assert forced["synced"] is True
-    specific = mcp.sync_garmin(day=_day(3))  # explicit day bypasses cooldown
-    assert specific["synced"] is True
-    assert fake.pulled == [_day(), _day(), _day(3)]
+    # 30 min later: inside the 60-min default interval → throttled with a
+    # structured skip result; but an explicit force (10-min floor) runs.
+    monkeypatch.setattr(mcp, "_minutes_since", lambda ts: 30.0)
+    throttled = mcp.sync_garmin()
+    assert throttled["synced"] is False
+    assert throttled["reason"] == "throttled_recent_sync"
+    assert throttled["minutes_since_last_sync"] == 30.0
+    assert throttled["last_synced_at"] is not None
+    assert fake.pulled == [_day()]  # no second hit on Garmin
+    assert mcp.sync_garmin(force=True)["synced"] is True
+
+    # 5 min later: even force is inside its own 10-min floor → throttled.
+    monkeypatch.setattr(mcp, "_minutes_since", lambda ts: 5.0)
+    assert mcp.sync_garmin(force=True)["synced"] is False
+
+    # An explicit day is a deliberate backfill and always bypasses throttling.
+    assert mcp.sync_garmin(day=_day(3))["synced"] is True
+    assert _day(3) in fake.pulled
 
 
 def test_sync_failure_is_reported_not_raised(db: Database, monkeypatch) -> None:
     monkeypatch.setattr(mcp, "_garmin", _FakeGarmin(db, error=RuntimeError("401 unauthorized")))
     result = mcp.sync_garmin(force=True)
     assert result["synced"] is False
+    assert result["reason"] == "sync_failed"
     assert "401" in result["error"]
     assert "garmin_login" in result["hint"]
 

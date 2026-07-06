@@ -23,8 +23,21 @@ from openai import OpenAI
 from .analysis import Analyzer
 from .config import settings
 from .database import Database, as_json
+from .sync_policy import classify_freshness, minutes_since
 
 log = logging.getLogger("garmin_coach.coach")
+
+# Plain-language freshness notes injected into the report context so the model
+# always has something concrete to say about how current the data is.
+_FRESHNESS_NOTE = {
+    "none": "No Garmin sync has ever run — use whatever Health Coach data exists "
+            "(profile, logged meals, plans, events).",
+    "fresh": "Garmin data is fresh (synced within the last ~90 minutes).",
+    "cached": "Garmin sync is a little stale — using cached data from the last "
+              "sync. Still usable; label it as cached.",
+    "stale": "Garmin sync is stale (over a day old) — using the latest cached "
+             "data. Keep going and label it as stale/cached, do not refuse.",
+}
 
 _SYSTEM_PROMPT = """\
 You are a personal health and fitness coach embedded in the user's own data \
@@ -44,6 +57,17 @@ debt, load spiking), steer toward rest even if it conflicts with the plan.
 - Prefer small, sustainable actions over heroic ones.
 - These are general wellness suggestions, not medical advice. If you see signs \
 that warrant a doctor (e.g. persistent large resting-HR jumps), say so plainly.
+
+Data freshness and availability:
+- You are given a `data_freshness` block. ALWAYS open with a one-line data \
+status (fresh / cached / stale, and roughly how old). If a Garmin sync is \
+stale or failed, keep going with the most recent cached Health Coach data and \
+label it as cached — never refuse or fall back to a generic plan just because \
+a Garmin sync is old or failed.
+- Only say data is unavailable when there is genuinely nothing to work with \
+(`has_usable_data` is false). Otherwise personalise from whatever is present: \
+profile and goals, logged meals and nutrition totals, training plans, health \
+events, hydration, and the cached Garmin-derived metrics.
 """
 
 _MORNING_INSTRUCTION = """\
@@ -51,6 +75,8 @@ Write today's morning briefing. Use this exact structure and keep it tight \
 (a Telegram message, so short lines, minimal markdown):
 
 ☀️ Good morning! Here's your day:
+
+📡 Data: <one line: fresh / cached / stale, from data_freshness>
 
 🎯 Top 3 priorities:
 1. ...
@@ -61,15 +87,24 @@ Write today's morning briefing. Use this exact structure and keep it tight \
 
 ✨ Recovery / appearance tip: <one actionable tip toward looking and feeling better>
 
-Base every line on the data and flags. If the data says rest, prescribe rest.
+Across the priorities cover: a walking/cardio step target, nutrition targets \
+(calories/protein from the profile) and a hydration target. Base every line on \
+the data and flags. If the data says rest, prescribe rest. If Garmin is \
+stale/failed, use the cached data and say so — never a generic plan.
 """
 
 _MORNING_INSTRUCTION_STRUCTURED = """\
-Produce today's morning briefing: exactly 3 priorities, one workout (a single \
-specific session — or an explicit rest day with the reason in `details` and \
-`is_rest_day` true), and one actionable recovery/appearance tip. Base every \
-field on the data and flags; if the data says rest, prescribe rest. Keep each \
-string short — this renders into a Telegram message.
+Produce today's morning briefing from the data provided. Requirements:
+- Priority 1 must open with the data-freshness status (fresh / cached / stale, \
+from `data_freshness`).
+- Exactly 3 priorities. Across them cover a walking/cardio step target, \
+nutrition targets (calories/protein from the profile) and a hydration target.
+- One workout: a single specific session (the train-or-recover call), or an \
+explicit rest day with the reason in `details` and `is_rest_day` true.
+- One actionable recovery/appearance tip (the day's single behaviour focus).
+Base every field on the data and flags; if the data says rest, prescribe rest. \
+If Garmin is stale/failed, use the cached data and label it — never a generic \
+plan. Keep each string short — this renders into a Telegram message.
 """
 
 _EVENING_INSTRUCTION = """\
@@ -78,17 +113,24 @@ message, so short lines, minimal markdown):
 
 🌙 Evening report
 
+📡 Data: <one line: fresh / cached / stale, from data_freshness>
 📋 Plan vs actual: how today went against the morning plan (use the plan,
 training-plan status and logged events)
-🍽 Meals & macros: totals vs targets; call out skipped or unlogged meals
-💧 Hydration / 👣 steps / 🏋️ training: the day's numbers
-🛌 Recovery: anything in the data worth noting for tomorrow
+🏋️ Training: workouts / training completion vs plan
+👣 Steps & cardio: the day's numbers
+🍽 Meals & macros: meals logged; calories/macros vs targets; protein, fiber,
+vegetables — call out skipped or unlogged meals
+💧 Hydration: intake vs target
+🛌 Sleep / recovery: anything in the data worth noting for tomorrow
 
 ✅ One thing that went well
-🔁 One thing to improve tomorrow
+🔁 What needs improvement
+🎯 Top 1–3 concrete changes for tomorrow
 
-Base every line on the data provided. If something wasn't logged, say so
-plainly instead of guessing.
+Base every line on the data provided. If meal logs are missing, say the meal
+logs are incomplete — do NOT say all data is unavailable when Garmin/Health
+Coach has other usable data. If Garmin is stale/failed, use the cached data and
+label it. If something wasn't logged, say so plainly instead of guessing.
 """
 
 
@@ -142,6 +184,30 @@ def _render_plan(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _has_usable_data(context: dict[str, Any]) -> bool:
+    """True when there is *any* Health Coach data to personalise from — so the
+    report never falls back to a generic plan while local data exists, even if
+    Garmin sync is stale or has never run."""
+    if context.get("profile"):
+        return True
+    if (context.get("analysis") or {}).get("available"):
+        return True
+    if context.get("training_plans_today"):
+        return True
+    if context.get("health_events_today"):
+        return True
+    if context.get("hydration_today"):
+        return True
+    if context.get("recent_feedback"):
+        return True
+    if context.get("recent_meals"):
+        return True
+    nutrition = context.get("nutrition_today") or []
+    if any((day.get("meal_count") or 0) > 0 for day in nutrition):
+        return True
+    return False
+
+
 class Coach:
     def __init__(self, db: Database | None = None) -> None:
         self.db = db or Database()
@@ -168,6 +234,57 @@ class Coach:
         feedback = self.db.recent_feedback(days=7)
         context = {"analysis": report, "recent_feedback": feedback}
         return as_json(context)
+
+    def _data_freshness(self) -> dict[str, Any]:
+        """How current the cached Garmin data is — a local read only, never a
+        network sync. Classifies the last pull as none/fresh/cached/stale so
+        every report can state its data status."""
+        last = self.db.last_pull()
+        ts = last["ts"] if last else None
+        minutes = minutes_since(ts)
+        status = classify_freshness(minutes)
+        return {
+            "status": status,  # none | fresh | cached | stale
+            "using_cached_data": status in ("cached", "stale"),
+            "last_synced_day": last["day"] if last else None,
+            "last_synced_at": ts.isoformat() if ts else None,
+            "minutes_since_last_sync": minutes,
+            "note": _FRESHNESS_NOTE[status],
+        }
+
+    def get_health_context_for_report(self, mode: str = "morning") -> dict[str, Any]:
+        """Read all locally-available Health Coach data for a plan/report.
+
+        Reads ONLY the local database — profile, analyzer summaries (cached
+        Garmin-derived metrics), today's nutrition/hydration/plans/health
+        events, and recent feedback. It never triggers a Garmin network sync:
+        sync is an optional refresh step the caller does separately (and which
+        is throttled), not a prerequisite for producing a report. The
+        ``data_freshness`` block says how current the cached Garmin data is,
+        and ``has_usable_data`` says whether there is anything to personalise
+        from at all.
+        """
+        today = date.today().isoformat()
+        context: dict[str, Any] = {
+            "data_freshness": self._data_freshness(),
+            "profile": self.db.get_profile(),
+            "analysis": self.analyzer.report(),
+            "training_plans_today": self.db.get_today_training_plans(),
+            "nutrition_today": self.db.nutrition_summary(day=today),
+            "hydration_today": self.db.recent_hydration(days=1),
+            "health_events_today": self.db.health_events_for_day(today),
+        }
+        if mode == "evening":
+            last_plan = self.db.last_plan()
+            context["todays_morning_plan"] = (
+                last_plan if last_plan and last_plan.get("day") == today else None
+            )
+            context["recent_feedback"] = self.db.recent_feedback(days=1)
+        else:
+            context["recent_meals"] = self.db.recent_meals(days=3)
+            context["recent_feedback"] = self.db.recent_feedback(days=7)
+        context["has_usable_data"] = _has_usable_data(context)
+        return context
 
     def _complete(self, messages: list[dict[str, str]], max_tokens: int = 600) -> str:
         resp = self.client.chat.completions.create(
@@ -210,14 +327,16 @@ class Coach:
                 log.info("Reusing today's saved morning plan.")
                 return existing["plan"]
 
+        context = self.get_health_context_for_report(mode="morning")
+
         def messages_for(instruction: str) -> list[dict[str, str]]:
             return [
                 {"role": "system", "content": self._system_prompt()},
                 {
                     "role": "user",
                     "content": (
-                        "Here is my current health data and trends:\n\n"
-                        f"{self._data_context()}\n\n{instruction}"
+                        "Here is my current Health Coach data and trends:\n\n"
+                        f"{as_json(context)}\n\n{instruction}"
                     ),
                 },
             ]
@@ -248,19 +367,7 @@ class Coach:
         workouts done). Like recent_feedback in chat, these are the user's own
         log entries — raw Garmin rows still never leave the analyzer.
         """
-        today = date.today().isoformat()
-        last_plan = self.db.last_plan()
-        context = {
-            "analysis": self.analyzer.report(),
-            "todays_morning_plan": (
-                last_plan if last_plan and last_plan.get("day") == today else None
-            ),
-            "training_plans_today": self.db.get_today_training_plans(),
-            "nutrition_today": self.db.nutrition_summary(day=today),
-            "hydration_today": self.db.recent_hydration(days=1),
-            "health_events_today": self.db.health_events_for_day(today),
-            "recent_feedback": self.db.recent_feedback(days=1),
-        }
+        context = self.get_health_context_for_report(mode="evening")
         messages = [
             {"role": "system", "content": self._system_prompt()},
             {

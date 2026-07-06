@@ -39,6 +39,16 @@ class Settings:
     garmin_token_dir: str = field(
         default_factory=lambda: _get("GARMIN_TOKEN_DIR", "/root/.garminconnect")
     )
+    # Garmin *network* sync throttling — only the network sync is rate limited;
+    # local Health Coach reads are never throttled. A normal on-demand refresh
+    # must wait this many minutes since the last pull …
+    default_min_sync_interval_minutes: int = field(
+        default_factory=lambda: _get_int("DEFAULT_MIN_SYNC_INTERVAL_MINUTES", 60)
+    )
+    # … an explicit force lowers (but does not remove) that floor to this.
+    force_sync_min_interval_minutes: int = field(
+        default_factory=lambda: _get_int("FORCE_SYNC_MIN_INTERVAL_MINUTES", 10)
+    )
 
     # OpenAI-compatible chat completions API. Defaults to OpenAI itself; set
     # OPENAI_BASE_URL to point the same `openai` SDK at another provider
