@@ -21,7 +21,7 @@ from garmin_coach.database import Database
 from garmin_coach.migrations import add_meal_macro_columns
 
 _MACRO_COLUMNS = {"protein_g", "carbs_g", "fat_g", "fiber_g", "sugar_g"}
-_HEAD_REVISION = "0003"
+_HEAD_REVISION = "0004"
 
 
 def _make_legacy_db(path: str) -> None:
@@ -310,6 +310,49 @@ def test_migration_adds_workout_and_training_plan_columns(tmp_path) -> None:
     assert updated["updated_at"] is not None
     merge_result = db.merge_garmin_strength_fragments("2026-06-30")
     assert merge_result["merged"] is False  # only one fragment — nothing to merge
+
+
+def test_migration_adds_workout_source_link_schema_to_legacy_db(tmp_path) -> None:
+    """0004: a workout table without ``field_sources`` and no
+    ``workout_source_link`` table gains both, losslessly and idempotently."""
+    path = str(tmp_path / "legacy_links.db")
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """CREATE TABLE workout (
+               activity_id INTEGER PRIMARY KEY, day VARCHAR NOT NULL,
+               name VARCHAR, type VARCHAR, duration_s FLOAT, distance_m FLOAT,
+               calories INTEGER, avg_hr INTEGER, max_hr INTEGER,
+               training_load FLOAT, source VARCHAR, load_source VARCHAR,
+               duplicate_of INTEGER, start_time VARCHAR, meta_json VARCHAR,
+               updated_at DATETIME NOT NULL
+           )"""
+    )
+    conn.execute(
+        "INSERT INTO workout (activity_id, day, name, type, training_load, "
+        "source, updated_at) VALUES "
+        "(808, '2026-06-30', 'Legacy lift', 'strength_training', 40.0, "
+        "'manual', '2026-06-30 12:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path=path)  # boot heals the schema
+    columns = {row[1] for row in sqlite3.connect(path).execute("PRAGMA table_info('workout')")}
+    assert "field_sources" in columns
+    tables = {
+        row[0]
+        for row in sqlite3.connect(path).execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    assert "workout_source_link" in tables
+
+    # Pre-existing row untouched, and the new merge machinery works on the
+    # healed schema.
+    legacy = db.recent_workouts(days=10_000)[0]
+    assert legacy["training_load"] == 40.0 and legacy["field_sources"] is None
+    for _ in range(2):  # further boots are no-ops
+        Database(path=path)
 
 
 def test_meal_logging_with_and_without_macros(tmp_path) -> None:
