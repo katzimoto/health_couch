@@ -615,7 +615,7 @@ def recommend_next_weights(exercises: list[str] | None = None, days: int = 120) 
                  "reason": "no logged history in the window"}
             )
             continue
-        rec = recommend_next_weight(history[0], caution)
+        rec = recommend_next_weight(history[0], caution, exercise_name=name)
         rec["exercise"] = name
         rec["last_trained"] = history[0]["date"]
         recommendations.append(rec)
