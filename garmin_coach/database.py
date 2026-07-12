@@ -35,6 +35,12 @@ from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from .config import settings
+from .exercise_metrics import (
+    log_malformed_value,
+    normalize_performance,
+    parse_float,
+    parse_int,
+)
 from .models import (
     SUMMARY_COLUMNS,
     BodyBattery,
@@ -608,7 +614,8 @@ class Database:
     # ── Strength sessions ──────────────────────────────────────────────────────
 
     def _strength_rpe(self, exercises: list[dict[str, Any]]) -> float | None:
-        rpes = [e.get("rpe") for e in exercises if e.get("rpe") is not None]
+        rpes = [parse_float(e.get("rpe")) for e in exercises]
+        rpes = [r for r in rpes if r is not None]
         return sum(rpes) / len(rpes) if rpes else None
 
     @staticmethod
@@ -617,22 +624,45 @@ class Database:
 
         Per-set data (``actual_sets``) is kept verbatim as JSON and also
         collapsed into the aggregate columns (top weight, average reps/RPE,
-        set count) so single-row history queries keep working. A ``completed:
-        False`` without an explicit status becomes status="skipped"."""
+        set count) so single-row history queries stay simple. Numeric columns
+        are coerced through the shared parsers when they arrive as strings
+        (``"3"``, ``"12.5"``); values that don't parse (a rep range, free
+        text) are stored verbatim and nulled at read time by
+        ``normalize_performance`` — except a list of reps, which SQLite can't
+        bind and is stored as JSON for ``parse_reps`` to recover. A
+        ``completed: False`` without an explicit status becomes
+        status="skipped"."""
         ex = dict(ex)
         actual_sets = ex.pop("actual_sets", None)
         if actual_sets:
             ex["set_details"] = json.dumps(actual_sets, ensure_ascii=False)
-            ex.setdefault("sets", len(actual_sets))
-            reps = [s.get("reps") for s in actual_sets if s.get("reps") is not None]
+            entries = [s for s in actual_sets if isinstance(s, dict)]
+            ex.setdefault("sets", len(entries) or None)
+            reps = [parse_int(s.get("reps")) for s in entries]
+            reps = [r for r in reps if r is not None]
             if reps and ex.get("reps") is None:
                 ex["reps"] = round(sum(reps) / len(reps))
-            weights = [s.get("weight_kg") for s in actual_sets if s.get("weight_kg") is not None]
+            weights = [parse_float(s.get("weight_kg")) for s in entries]
+            weights = [w for w in weights if w is not None]
             if weights and ex.get("weight_kg") is None:
                 ex["weight_kg"] = max(weights)
-            rpes = [s.get("rpe") for s in actual_sets if s.get("rpe") is not None]
+            rpes = [parse_float(s.get("rpe")) for s in entries]
+            rpes = [r for r in rpes if r is not None]
             if rpes and ex.get("rpe") is None:
                 ex["rpe"] = round(sum(rpes) / len(rpes), 1)
+        for field, parser in (
+            ("sets", parse_int), ("reps", parse_int), ("planned_sets", parse_int),
+            ("weight_kg", parse_float), ("planned_weight_kg", parse_float),
+            ("rpe", parse_float), ("rir", parse_float), ("rest_s", parse_float),
+        ):
+            value = ex.get(field)
+            if value is None:
+                continue
+            parsed = parser(value)
+            if parsed is not None:
+                ex[field] = parsed
+            elif isinstance(value, (list, tuple)):
+                ex[field] = json.dumps(value, ensure_ascii=False)
         if ex.get("status") is None and ex.get("completed") is False:
             ex["status"] = "skipped"
         return ex
@@ -839,22 +869,27 @@ class Database:
         history = []
         for exercise, session in rows:
             detail = self._exercise_dict(exercise)
-            actual_sets = detail.get("actual_sets") or []
-            per_set = [
-                (s.get("reps"), s.get("weight_kg"))
-                for s in actual_sets
-                if s.get("reps") is not None and s.get("weight_kg") is not None
-            ]
-            if per_set:
-                volume = round(sum(r * w for r, w in per_set), 1)
-                best = max(w for _r, w in per_set)
-            else:
-                volume = (
-                    round(exercise.sets * exercise.reps * exercise.weight_kg, 1)
-                    if exercise.sets and exercise.reps and exercise.weight_kg
-                    else None
-                )
-                best = exercise.weight_kg
+            # Legacy/malformed rows can hold strings, ranges, or JSON lists in
+            # the numeric columns — all math goes through the normalizer, and
+            # unusable fields come back as None instead of failing the row.
+            perf = normalize_performance(
+                detail,
+                endpoint="get_exercise_history",
+                exercise_name=exercise.exercise_name,
+                session_id=session.id,
+                row_id=exercise.id,
+            )
+            dropped = list(perf.dropped_fields)
+            for planned_field, parser in (
+                ("planned_sets", parse_int), ("planned_weight_kg", parse_float),
+            ):
+                raw = detail.get(planned_field)
+                if raw is not None and parser(raw) is None:
+                    dropped.append(planned_field)
+                    log_malformed_value(
+                        "get_exercise_history", exercise.exercise_name,
+                        session.id, exercise.id, planned_field, raw,
+                    )
             history.append(
                 {
                     "date": session.day,
@@ -862,21 +897,25 @@ class Database:
                     "session_name": session.session_name,
                     "gym": session.gym,
                     "machine": exercise.machine,
-                    "planned_sets": exercise.planned_sets,
+                    "planned_sets": parse_int(exercise.planned_sets),
                     "planned_reps": exercise.planned_reps,
-                    "planned_weight_kg": exercise.planned_weight_kg,
-                    "sets": exercise.sets,
-                    "reps": exercise.reps,
-                    "weight_kg": exercise.weight_kg,
-                    "actual_sets": actual_sets or None,
-                    "estimated_volume_kg": volume,
-                    "best_set_weight_kg": best,
-                    "rpe": exercise.rpe,
-                    "rir": exercise.rir,
+                    "planned_weight_kg": parse_float(exercise.planned_weight_kg),
+                    "sets": perf.sets,
+                    "reps": round(perf.average_reps) if perf.average_reps is not None else None,
+                    "weight_kg": perf.weight_kg,
+                    "actual_sets": detail.get("actual_sets") or None,
+                    "estimated_volume_kg": perf.volume,
+                    "best_set_weight_kg": perf.best_set_weight_kg,
+                    "rpe": perf.rpe,
+                    "rir": perf.rir,
                     "status": exercise.status,
                     "substitute_exercise": exercise.substitute_exercise,
                     "completed": exercise.completed,
                     "pain_note": exercise.pain_note,
+                    "data_quality": (
+                        f"unreadable stored values in: {', '.join(dropped)}"
+                        if dropped else None
+                    ),
                 }
             )
         return history
