@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from garmin_coach.database import Database
-from garmin_coach.scheduler import SchedulerService
+from garmin_coach.storage.database import Database
+from garmin_coach.surfaces.scheduler import SchedulerService
 
 
 @pytest.fixture()

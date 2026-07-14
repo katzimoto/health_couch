@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from garmin_coach.coach import Coach, _render_plan
-from garmin_coach.database import Database
+from garmin_coach.domain.coach import Coach, _render_plan
+from garmin_coach.storage.database import Database
 
 _PLAN = {
     "priorities": ["Drink 2L water", "Walk 8k steps", "In bed by 22:30"],

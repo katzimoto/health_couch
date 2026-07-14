@@ -12,11 +12,11 @@ from datetime import date, timedelta
 
 import pytest
 
-import garmin_coach.mcp_server as mcp
-from garmin_coach.mcp_tools import runtime
-from garmin_coach.database import Database
-from garmin_coach.models import WorkoutSourceLink
-from garmin_coach.workout_merge import (
+import garmin_coach.surfaces.mcp_server as mcp
+from garmin_coach.surfaces.mcp_tools import runtime
+from garmin_coach.storage.database import Database
+from garmin_coach.storage.models import WorkoutSourceLink
+from garmin_coach.domain.workout_merge import (
     best_strength_match,
     merge_fields,
     strength_match,

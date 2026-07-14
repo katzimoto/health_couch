@@ -11,15 +11,15 @@ from datetime import date, timedelta
 
 import pytest
 
-from garmin_coach.analysis import Analyzer
-from garmin_coach.apple_health import import_export
-from garmin_coach.coaching_context import (
+from garmin_coach.domain.analysis import Analyzer
+from garmin_coach.ingest.apple_health import import_export
+from garmin_coach.domain.coaching_context import (
     build_coaching_context,
     build_recommendation,
     classify_recovery,
     detect_workout_quality_warnings,
 )
-from garmin_coach.database import Database
+from garmin_coach.storage.database import Database
 
 
 @pytest.fixture()

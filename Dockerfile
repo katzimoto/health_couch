@@ -20,4 +20,4 @@ COPY scripts/ ./scripts/
 RUN mkdir -p /app/data
 
 # Default role; overridden per-service in docker-compose.
-CMD ["python", "-m", "garmin_coach.scheduler"]
+CMD ["python", "-m", "garmin_coach.surfaces.scheduler"]

@@ -11,9 +11,9 @@ from datetime import date, timedelta
 
 import pytest
 
-import garmin_coach.garmin_client as garmin_client
-from garmin_coach.database import Database
-from garmin_coach.garmin_client import GarminClient
+import garmin_coach.ingest.garmin_client as garmin_client
+from garmin_coach.storage.database import Database
+from garmin_coach.ingest.garmin_client import GarminClient
 
 
 class FakeGarminApi:

@@ -16,7 +16,7 @@ services:
   # ── Phase 1/2: daily Garmin pull + 07:30 morning plan ─────────────────────────
   scheduler:
     <<: *common
-    command: ["python", "-m", "garmin_coach.scheduler"]
+    command: ["python", "-m", "garmin_coach.surfaces.scheduler"]
     # The service touches data/heartbeats/scheduler every 5 minutes; a stale
     # file means the loop is wedged or dead (an import-only check can't tell).
     healthcheck:
@@ -29,7 +29,7 @@ services:
   # ── Phase 1: FastMCP server for ChatGPT Pro ───────────────────────────────────
   mcp:
     <<: *common
-    command: ["python", "-m", "garmin_coach.mcp_server"]
+    command: ["python", "-m", "garmin_coach.surfaces.mcp_server"]
     expose:
       - "8000"
     healthcheck:
@@ -55,7 +55,7 @@ services:
   # set DASHBOARD_TOKEN and require ?token=… before exposing it publicly.
   dashboard:
     <<: *common
-    command: ["python", "-m", "garmin_coach.webapp"]
+    command: ["python", "-m", "garmin_coach.surfaces.webapp"]
     ports:
       - "${DASHBOARD_PORT:-8050}:8050"
     healthcheck:
@@ -69,7 +69,7 @@ services:
   # Enable once you've set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
   telegram:
     <<: *common
-    command: ["python", "-m", "garmin_coach.telegram_bot"]
+    command: ["python", "-m", "garmin_coach.surfaces.telegram_bot"]
     # The bot touches data/heartbeats/telegram every 60s from its event loop,
     # so a wedged loop (e.g. blocked on a sync call) turns the container
     # unhealthy instead of passing an import-only check.

@@ -8,10 +8,10 @@ from datetime import date, timedelta
 
 import pytest
 
-import garmin_coach.mcp_server as mcp
-from garmin_coach.database import Database
-from garmin_coach.mcp_tools import runtime
-from garmin_coach.workout_flow import WorkoutLogFlows
+import garmin_coach.surfaces.mcp_server as mcp
+from garmin_coach.storage.database import Database
+from garmin_coach.surfaces.mcp_tools import runtime
+from garmin_coach.domain.workout_flow import WorkoutLogFlows
 
 
 @pytest.fixture()
@@ -377,7 +377,7 @@ def test_merge_ignores_non_strength_and_manual_workouts(db: Database) -> None:
 
 # ── Feature 5: workout-log flow ─────────────────────────────────────────────────
 
-from garmin_coach.workout_flow import (  # noqa: E402
+from garmin_coach.domain.workout_flow import (  # noqa: E402
     default_exercises,
     parse_completion,
     parse_duration_seconds,
@@ -584,7 +584,7 @@ from unittest.mock import AsyncMock  # noqa: E402
 
 from telegram.ext import ApplicationHandlerStop  # noqa: E402
 
-from garmin_coach.telegram_bot import TelegramCoach  # noqa: E402
+from garmin_coach.surfaces.telegram_bot import TelegramCoach  # noqa: E402
 
 
 def _text_update(text: str, chat_id: int = 12345):

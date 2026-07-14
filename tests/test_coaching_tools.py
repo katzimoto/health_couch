@@ -9,10 +9,10 @@ from datetime import date, timedelta
 
 import pytest
 
-import garmin_coach.mcp_server as mcp
-from garmin_coach.mcp_tools import runtime
-from garmin_coach.database import Database
-from garmin_coach.training_load import estimate_training_load
+import garmin_coach.surfaces.mcp_server as mcp
+from garmin_coach.surfaces.mcp_tools import runtime
+from garmin_coach.storage.database import Database
+from garmin_coach.domain.training_load import estimate_training_load
 
 
 @pytest.fixture()
@@ -190,7 +190,7 @@ def test_recommendation_progresses_when_rpe_low(db: Database) -> None:
         _day(3),
         exercises=[{"exercise_name": "Leg Press", "actual_sets": _LEG_PRESS_SETS}],
     )
-    from garmin_coach.progression import recommend_next_weight
+    from garmin_coach.domain.progression import recommend_next_weight
 
     rec = recommend_next_weight(db.exercise_history("Leg Press")[0])
     # Aggregate RPE 7.5 → in the maintain zone: add reps before load.
@@ -208,7 +208,7 @@ def test_recommendation_progresses_when_rpe_low(db: Database) -> None:
 
 
 def test_recommendation_backs_off_on_high_rpe_or_pain() -> None:
-    from garmin_coach.progression import recommend_next_weight
+    from garmin_coach.domain.progression import recommend_next_weight
 
     grinding = recommend_next_weight({"best_set_weight_kg": 100, "rpe": 9})
     assert grinding["action"] == "reduce"
@@ -260,7 +260,7 @@ def test_recommend_covers_recently_trained_when_unspecified(db: Database, monkey
 
 
 def test_stale_readiness_does_not_gate_progress() -> None:
-    from garmin_coach.progression import recovery_caution
+    from garmin_coach.domain.progression import recovery_caution
 
     report = {
         "available": True,
@@ -423,7 +423,7 @@ def test_training_load_not_zero_for_unlabelled_workouts(db: Database) -> None:
             source="garmin", load_source="estimated",
         )
     db.upsert_steps(_day(27), steps=100)  # anchor the ACR history span
-    from garmin_coach.analysis import Analyzer
+    from garmin_coach.domain.analysis import Analyzer
 
     acr = Analyzer(db).acute_chronic_ratio()
     assert acr["acute_7d"] > 0  # previously read as complete rest
@@ -449,7 +449,7 @@ def test_readiness_roundtrip_and_report_inclusion(db: Database) -> None:
     rows = db.recent_readiness(days=7)
     assert rows[-1]["soreness_1_10"] == 7
 
-    from garmin_coach.analysis import Analyzer
+    from garmin_coach.domain.analysis import Analyzer
 
     db.upsert_sleep(_day(), score=80, total_seconds=7 * 3600)
     report = Analyzer(db).report()
@@ -457,7 +457,7 @@ def test_readiness_roundtrip_and_report_inclusion(db: Database) -> None:
 
 
 def test_missing_readiness_breaks_nothing(db: Database) -> None:
-    from garmin_coach.analysis import Analyzer
+    from garmin_coach.domain.analysis import Analyzer
 
     db.upsert_sleep(_day(), score=80, total_seconds=7 * 3600)
     assert Analyzer(db).report()["readiness"] is None

@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from garmin_coach.config import settings  # noqa: E402
-from garmin_coach.garmin_client import GarminClient  # noqa: E402
+from garmin_coach.ingest.garmin_client import GarminClient  # noqa: E402
 
 
 def main() -> int:

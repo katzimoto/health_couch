@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from garmin_coach.database import Database
-from garmin_coach.telegram_bot import TelegramCoach
+from garmin_coach.storage.database import Database
+from garmin_coach.surfaces.telegram_bot import TelegramCoach
 
 
 def _update(chat_id=None, no_chat: bool = False):

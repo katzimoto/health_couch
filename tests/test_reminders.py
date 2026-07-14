@@ -8,18 +8,18 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-import garmin_coach.mcp_server as mcp
-from garmin_coach.mcp_tools import runtime
-import garmin_coach.scheduler as scheduler_mod
-from garmin_coach.database import Database
-from garmin_coach.reminders import (
+import garmin_coach.surfaces.mcp_server as mcp
+from garmin_coach.surfaces.mcp_tools import runtime
+import garmin_coach.surfaces.scheduler as scheduler_mod
+from garmin_coach.storage.database import Database
+from garmin_coach.domain.reminders import (
     PRESET_REMINDERS,
     Reminders,
     as_utc,
     compute_next_run,
 )
-from garmin_coach.scheduler import SchedulerService
-from garmin_coach.telegram_bot import TelegramCoach
+from garmin_coach.surfaces.scheduler import SchedulerService
+from garmin_coach.surfaces.telegram_bot import TelegramCoach
 
 
 @pytest.fixture()

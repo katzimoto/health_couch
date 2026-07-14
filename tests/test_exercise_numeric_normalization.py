@@ -17,17 +17,17 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 from sqlalchemy import text
 
-import garmin_coach.mcp_server as mcp
-from garmin_coach.mcp_tools import runtime
-from garmin_coach.database import Database
-from garmin_coach.exercise_metrics import (
+import garmin_coach.surfaces.mcp_server as mcp
+from garmin_coach.surfaces.mcp_tools import runtime
+from garmin_coach.storage.database import Database
+from garmin_coach.domain.exercise_metrics import (
     normalize_performance,
     parse_float,
     parse_int,
     parse_rep_range,
     parse_reps,
 )
-from garmin_coach.progression import recommend_next_weight
+from garmin_coach.domain.progression import recommend_next_weight
 
 
 @pytest.fixture()

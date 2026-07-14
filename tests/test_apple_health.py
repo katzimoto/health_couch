@@ -7,9 +7,9 @@ import zipfile
 import pytest
 from sqlmodel import select
 
-from garmin_coach.apple_health import MEAL_NAME, NOTE_TAG, import_export
-from garmin_coach.database import Database
-from garmin_coach.models import Meal, Vital, Workout
+from garmin_coach.ingest.apple_health import MEAL_NAME, NOTE_TAG, import_export
+from garmin_coach.storage.database import Database
+from garmin_coach.storage.models import Meal, Vital, Workout
 
 _EXPORT_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <HealthData locale="en_US">

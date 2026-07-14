@@ -19,11 +19,11 @@ def client(tmp_path, monkeypatch):
     # real, non-temp database if one happens to be mounted at that path.
     import garmin_coach.config as config
     importlib.reload(config)
-    import garmin_coach.database as database
+    import garmin_coach.storage.database as database
     importlib.reload(database)
-    import garmin_coach.analysis as analysis
+    import garmin_coach.domain.analysis as analysis
     importlib.reload(analysis)
-    import garmin_coach.webapp as webapp
+    import garmin_coach.surfaces.webapp as webapp
     importlib.reload(webapp)
 
     # Seed a couple of days directly through the app's DB handle.
@@ -66,11 +66,11 @@ def test_token_gate(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_TOKEN", "sekret")
     import garmin_coach.config as config
     importlib.reload(config)
-    import garmin_coach.database as database
+    import garmin_coach.storage.database as database
     importlib.reload(database)
-    import garmin_coach.analysis as analysis
+    import garmin_coach.domain.analysis as analysis
     importlib.reload(analysis)
-    import garmin_coach.webapp as webapp
+    import garmin_coach.surfaces.webapp as webapp
     importlib.reload(webapp)
 
     c = TestClient(webapp.build_app())

@@ -17,8 +17,8 @@ from datetime import date, timedelta
 
 from alembic import command
 
-from garmin_coach.database import Database
-from garmin_coach.migrations import add_meal_macro_columns
+from garmin_coach.storage.database import Database
+from garmin_coach.storage.migrations import add_meal_macro_columns
 
 _MACRO_COLUMNS = {"protein_g", "carbs_g", "fat_g", "fiber_g", "sugar_g"}
 _HEAD_REVISION = "0004"
@@ -109,11 +109,11 @@ def test_mcp_log_meal_hummus_end_to_end(tmp_path, monkeypatch) -> None:
     # pattern as test_web) so the tools bind to the legacy temp DB.
     import garmin_coach.config as config
     importlib.reload(config)
-    import garmin_coach.database as database
+    import garmin_coach.storage.database as database
     importlib.reload(database)
-    import garmin_coach.analysis as analysis
+    import garmin_coach.domain.analysis as analysis
     importlib.reload(analysis)
-    import garmin_coach.mcp_server as mcp_server
+    import garmin_coach.surfaces.mcp_server as mcp_server
     importlib.reload(mcp_server)
 
     try:

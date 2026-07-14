@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from .config import settings
+from garmin_coach.config import settings
 
 log = logging.getLogger("garmin_coach.heartbeat")
 

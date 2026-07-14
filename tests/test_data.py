@@ -10,8 +10,8 @@ from datetime import date, timedelta
 
 import pytest
 
-from garmin_coach.analysis import Analyzer
-from garmin_coach.database import Database
+from garmin_coach.domain.analysis import Analyzer
+from garmin_coach.storage.database import Database
 
 
 @pytest.fixture()
@@ -104,7 +104,7 @@ def test_analyzer_report_and_flags(db: Database) -> None:
 
 
 def test_partial_upsert_preserves_existing_fields(db: Database) -> None:
-    from garmin_coach.models import Weight
+    from garmin_coach.storage.models import Weight
 
     d = date.today()
     db.upsert_weight(d, weight_kg=80.0, body_fat=20.0, muscle_kg=35.0)
