@@ -152,7 +152,14 @@ class Hydration(SQLModel, table=True):
 
 
 class Meal(SQLModel, table=True):
-    """User-logged nutrition (via MCP tool or Telegram) — not pulled from Garmin."""
+    """User-logged nutrition (via MCP tool or Telegram) — not pulled from Garmin.
+
+    Macros are all nullable so a calories-only meal is valid and nutrition
+    totals only ever sum the values that are actually present (see
+    ``Database.nutrition_summary``). ``source``/``source_record_id`` give the
+    row provenance (``manual`` | ``apple`` | ``telegram`` | ...) and let an
+    importer dedupe idempotently on the originating record's id.
+    """
 
     id: Optional[int] = Field(default=None, primary_key=True)
     day: str = Field(index=True)
@@ -164,6 +171,11 @@ class Meal(SQLModel, table=True):
     fat_g: Optional[float] = None
     fiber_g: Optional[float] = None
     sugar_g: Optional[float] = None
+    sodium_mg: Optional[float] = None
+    # Provenance (all nullable — legacy rows predate these columns).
+    source: Optional[str] = None  # manual | apple | telegram | import
+    source_record_id: Optional[str] = None  # id in the originating system
+    is_estimated: Optional[bool] = None
     note: Optional[str] = None
 
 
@@ -252,6 +264,58 @@ class Profile(SQLModel, table=True):
     notes: Optional[str] = None
     # Comma-separated dedupe preference, e.g. "garmin,apple,manual".
     activity_source_priority: Optional[str] = None
+    # ── Configurable sleep need (no more hard-coded 8 hours) ────────────────
+    # sleep_target_hours is the debt reference; the preferred band and the
+    # minimum-recovery floor feed recovery classification. ``effective_from``
+    # records when the *current* target took effect; historical, effective-
+    # dated targets live in ``SleepTargetHistory`` so old sleep-debt numbers
+    # stay reproducible after a change.
+    sleep_target_hours: Optional[float] = None
+    sleep_preferred_min_hours: Optional[float] = None
+    sleep_preferred_max_hours: Optional[float] = None
+    sleep_minimum_recovery_hours: Optional[float] = None
+    sleep_target_effective_from: Optional[str] = None  # YYYY-MM-DD
+    # ── Persistent hydration configuration ──────────────────────────────────
+    hydration_baseline_target_ml: Optional[int] = None
+    hydration_training_day_target_ml: Optional[int] = None
+    hydration_hot_day_target_ml: Optional[int] = None
+    hydration_medical_limit_note: Optional[str] = None
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class SleepTargetHistory(SQLModel, table=True):
+    """Effective-dated sleep-target changes so historical sleep-debt numbers
+    stay reproducible after the user updates their target.
+
+    ``sleep_target_for(day)`` returns the target whose ``effective_from`` is the
+    latest one on-or-before ``day``. One row is appended per change; the current
+    value is mirrored onto ``Profile.sleep_target_hours`` for quick reads.
+    """
+
+    __tablename__ = "sleep_target_history"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    effective_from: str = Field(index=True)  # YYYY-MM-DD
+    target_hours: float
+    minimum_recovery_hours: Optional[float] = None
+    note: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class FeatureRequest(SQLModel, table=True):
+    """First-class server-side feature backlog — so requirements live in a
+    queryable table with status/priority instead of only free-text profile
+    notes. CRUD via the MCP feature-request tools."""
+
+    __tablename__ = "feature_request"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    title: str
+    description: Optional[str] = None
+    priority: Optional[str] = None  # low | medium | high
+    status: str = "requested"  # requested|planned|in_progress|blocked|implemented|rejected
+    requested_by: Optional[str] = None
+    related_endpoint: Optional[str] = None
+    resolution_notes: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
 

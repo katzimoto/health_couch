@@ -21,6 +21,7 @@ from typing import Any
 from openai import OpenAI
 
 from .analysis import Analyzer
+from .coaching_context import build_coaching_context
 from .config import settings
 from .database import Database, as_json
 
@@ -163,10 +164,26 @@ class Coach:
         return _SYSTEM_PROMPT.format(goals=settings.coach_goals)
 
     def _data_context(self) -> str:
-        """The analyzer report plus recent feedback, as a data block."""
+        """The analyzer report, the structured daily coaching context, plus
+        recent feedback, as a data block.
+
+        The coaching context carries the transparent recovery classification and
+        the structured recommendation (training decision, targets, top priority),
+        so the morning-plan automation renders *that* decision rather than
+        re-deriving one. ``refresh_if_stale`` is off here — the scheduler already
+        syncs Garmin hourly, and the plan job must not block on a network pull."""
         report = self.analyzer.report()
         feedback = self.db.recent_feedback(days=7)
-        context = {"analysis": report, "recent_feedback": feedback}
+        try:
+            coaching = build_coaching_context(self.db, refresh_if_stale=False)
+        except Exception:  # noqa: BLE001 — never let context assembly break the plan
+            log.warning("Coaching context assembly failed.", exc_info=True)
+            coaching = None
+        context = {
+            "analysis": report,
+            "coaching_context": coaching,
+            "recent_feedback": feedback,
+        }
         return as_json(context)
 
     def _complete(self, messages: list[dict[str, str]], max_tokens: int = 600) -> str:

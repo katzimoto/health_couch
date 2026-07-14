@@ -96,9 +96,11 @@ def test_analyzer_report_and_flags(db: Database) -> None:
     report = Analyzer(db).report()
     assert report["available"] is True
     assert report["trends"]["hrv"]["avg_7d"] == 60
-    # Steady 7h sleep vs 8h target => ~7h debt over the week => flagged.
-    assert report["sleep_debt_7d"] == pytest.approx(7.0, abs=0.1)
-    assert any("Sleep debt" in f for f in report["flags"])
+    # Steady 7h sleep meets the configured 7h baseline => no debt (the old
+    # hard-coded 8h target is gone; debt is clamped per night at max(0, ...)).
+    assert report["sleep_target_hours"] == pytest.approx(7.0, abs=0.01)
+    assert report["sleep_debt_7d"] == pytest.approx(0.0, abs=0.1)
+    assert not any("Sleep debt" in f for f in report["flags"])
 
 
 def test_partial_upsert_preserves_existing_fields(db: Database) -> None:
