@@ -32,6 +32,7 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.auth.providers.workos import AuthKitProvider
 
 from .analysis import Analyzer
+from .coaching_context import build_coaching_context
 from .config import settings
 from .database import Database, synthetic_activity_id as _synthetic_activity_id
 from .garmin_client import GarminClient
@@ -159,6 +160,62 @@ def get_full_report() -> dict:
     return report
 
 
+def _refresh_today_from_garmin() -> dict:
+    """Sync callback handed to the coaching-context builder: pull today from
+    Garmin now. Isolated so a broken Garmin auth degrades to stale data with a
+    visible warning instead of failing the whole coaching call."""
+    return _garmin_client().pull_day(date.today().isoformat())
+
+
+@mcp.tool
+def get_today_coaching_context(
+    day: str | None = None,
+    refresh_if_stale: bool = True,
+    include_recommendation: bool = True,
+) -> dict:
+    """THE daily-coaching call: everything needed to answer "based on all my
+    current data, what should I do today?" in one structured payload.
+
+    Returns data_freshness (which sources were retrieved vs missing, and whether
+    a refresh ran), profile, recovery (classification + confidence + reasons),
+    sleep (against the user's *configured* target, not a hard-coded 8h),
+    activity, training_load, recent_workouts, strength_history, body_composition,
+    nutrition, hydration (with configured targets; missing intake stays unknown,
+    never zero), pending_training_plan, flags, data_quality_warnings and — when
+    ``include_recommendation`` — a structured recommendation (training decision,
+    intensity, suggested session, step/cardio/sleep/hydration targets, nutrition
+    priorities, and one top priority).
+
+    With ``refresh_if_stale`` (default true) a stale Garmin sync (>90 min) is
+    refreshed first; if Garmin is unreachable the latest cached data is used and
+    the failure is reported under data_freshness.refresh rather than returning a
+    generic "connector unavailable"."""
+    return build_coaching_context(
+        db,
+        day=day,
+        refresh_if_stale=refresh_if_stale,
+        include_recommendation=include_recommendation,
+        garmin_sync=_refresh_today_from_garmin if refresh_if_stale else None,
+    )
+
+
+@mcp.tool
+def generate_daily_plan(
+    day: str | None = None,
+    refresh_if_stale: bool = True,
+) -> dict:
+    """Backward-compatible alias / thin wrapper over get_today_coaching_context
+    that always includes the structured recommendation — the shape scheduled
+    daily jobs consume to build and deliver the morning plan."""
+    return build_coaching_context(
+        db,
+        day=day,
+        refresh_if_stale=refresh_if_stale,
+        include_recommendation=True,
+        garmin_sync=_refresh_today_from_garmin if refresh_if_stale else None,
+    )
+
+
 @mcp.tool
 def get_feedback(days: int = 30) -> list[dict]:
     """Feedback notes logged via the Telegram coach (/done, /skipped, /felt)
@@ -182,12 +239,19 @@ def log_meal(
     fat_g: float | None = None,
     fiber_g: float | None = None,
     sugar_g: float | None = None,
+    sodium_mg: float | None = None,
     day: str | None = None,
+    source: str | None = None,
+    source_record_id: str | None = None,
+    is_estimated: bool | None = None,
     note: str = "",
 ) -> dict:
     """Log a meal (e.g. from a description, photo, or Apple Health nutrition
-    entry the user gives you). Macros are optional. ``day`` defaults to today
-    (ISO ``YYYY-MM-DD``). Returns the day's meals so far."""
+    entry the user gives you). All macros are optional — a calories-only meal is
+    valid and totals only sum what's present. ``day`` defaults to today (ISO
+    ``YYYY-MM-DD``). Pass ``source`` + ``source_record_id`` for idempotent
+    imports (re-logging the same source record updates it in place). Returns the
+    day's meals so far."""
     target_day = day or date.today().isoformat()
     db.add_meal(
         name=name,
@@ -198,6 +262,10 @@ def log_meal(
         fat_g=fat_g,
         fiber_g=fiber_g,
         sugar_g=sugar_g,
+        sodium_mg=sodium_mg,
+        source=source,
+        source_record_id=source_record_id,
+        is_estimated=is_estimated,
         note=note or None,
     )
     return {"logged": True, "day": target_day, "meals_today": db.recent_meals(days=1)}
@@ -336,6 +404,10 @@ def log_apple_health_export(records: list[dict]) -> dict:
                     fat_g=rec.get("fat_g"),
                     fiber_g=rec.get("fiber_g"),
                     sugar_g=rec.get("sugar_g"),
+                    sodium_mg=rec.get("sodium_mg"),
+                    source=rec.get("source"),
+                    source_record_id=rec.get("source_record_id"),
+                    is_estimated=rec.get("is_estimated"),
                     note=rec.get("note"),
                 )
             elif kind == "workout":
@@ -498,6 +570,14 @@ def set_profile(
     carbs_target_g: float | None = None,
     fat_target_g: float | None = None,
     fiber_target_g: float | None = None,
+    sleep_target_hours: float | None = None,
+    sleep_preferred_min_hours: float | None = None,
+    sleep_preferred_max_hours: float | None = None,
+    sleep_minimum_recovery_hours: float | None = None,
+    hydration_baseline_target_ml: int | None = None,
+    hydration_training_day_target_ml: int | None = None,
+    hydration_hot_day_target_ml: int | None = None,
+    hydration_medical_limit_note: str | None = None,
     notes: str | None = None,
     replace: bool = False,
 ) -> dict:
@@ -505,7 +585,13 @@ def set_profile(
     fields you pass change. Set ``replace=True`` only when the user
     explicitly wants the whole profile rewritten. goal_type: fat_loss |
     muscle_gain | recomposition | endurance | general_health; training_level:
-    beginner | intermediate | advanced."""
+    beginner | intermediate | advanced.
+
+    Sleep target defaults to a 7.0h baseline (never a hard-coded 8h). To change
+    the sleep target with a proper effective date (so historical sleep-debt
+    stays reproducible), prefer ``set_sleep_target``; setting
+    ``sleep_target_hours`` here updates the current value only. Hydration
+    targets persist here and drive the coaching recommendation."""
     return db.set_profile(
         replace=replace,
         age=age, sex=sex, height_cm=height_cm,
@@ -516,8 +602,82 @@ def set_profile(
         preferred_training_days=preferred_training_days,
         food_restrictions=food_restrictions, calorie_target=calorie_target,
         protein_target_g=protein_target_g, carbs_target_g=carbs_target_g,
-        fat_target_g=fat_target_g, fiber_target_g=fiber_target_g, notes=notes,
+        fat_target_g=fat_target_g, fiber_target_g=fiber_target_g,
+        sleep_target_hours=sleep_target_hours,
+        sleep_preferred_min_hours=sleep_preferred_min_hours,
+        sleep_preferred_max_hours=sleep_preferred_max_hours,
+        sleep_minimum_recovery_hours=sleep_minimum_recovery_hours,
+        hydration_baseline_target_ml=hydration_baseline_target_ml,
+        hydration_training_day_target_ml=hydration_training_day_target_ml,
+        hydration_hot_day_target_ml=hydration_hot_day_target_ml,
+        hydration_medical_limit_note=hydration_medical_limit_note,
+        notes=notes,
     )
+
+
+@mcp.tool
+def set_sleep_target(
+    target_hours: float,
+    effective_from: str | None = None,
+    minimum_recovery_hours: float | None = None,
+    preferred_min_hours: float | None = None,
+    preferred_max_hours: float | None = None,
+    note: str | None = None,
+) -> dict:
+    """Set the user's sleep-need target (hours) with an effective date so past
+    sleep-debt numbers stay reproducible. ``effective_from`` defaults to today.
+    The baseline is 7.0h — this replaces any hard-coded 8h assumption. Sleep
+    debt is computed as the shortfall vs this target (an estimate, not a
+    physiological measurement)."""
+    return db.set_sleep_target(
+        target_hours=target_hours,
+        effective_from=effective_from,
+        minimum_recovery_hours=minimum_recovery_hours,
+        preferred_min_hours=preferred_min_hours,
+        preferred_max_hours=preferred_max_hours,
+        note=note,
+    )
+
+
+@mcp.tool
+def create_feature_request(
+    title: str,
+    description: str | None = None,
+    priority: str | None = None,
+    related_endpoint: str | None = None,
+    requested_by: str | None = None,
+) -> dict:
+    """Record a feature request in the server-side backlog (a real table, not a
+    free-text profile note). status starts as ``requested``. priority: low |
+    medium | high."""
+    return db.create_feature_request(
+        title=title, description=description, priority=priority,
+        related_endpoint=related_endpoint, requested_by=requested_by,
+    )
+
+
+@mcp.tool
+def list_feature_requests(status: str | None = None) -> list[dict]:
+    """List backlog feature requests, newest first. Filter by ``status``:
+    requested | planned | in_progress | blocked | implemented | rejected."""
+    return db.list_feature_requests(status=status)
+
+
+@mcp.tool
+def update_feature_request(
+    request_id: int,
+    status: str | None = None,
+    priority: str | None = None,
+    resolution_notes: str | None = None,
+    description: str | None = None,
+) -> dict:
+    """Update a feature request (status/priority/notes). Returns the updated row,
+    or an error if the id is unknown."""
+    result = db.update_feature_request(
+        request_id, status=status, priority=priority,
+        resolution_notes=resolution_notes, description=description,
+    )
+    return result or {"error": f"No feature request with id {request_id}"}
 
 
 # ── Strength training ───────────────────────────────────────────────────────────

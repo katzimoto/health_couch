@@ -80,7 +80,11 @@ _NUTRITION = {
     f"{_HK}DietaryFatTotal": "fat_g",
     f"{_HK}DietaryFiber": "fiber_g",
     f"{_HK}DietarySugar": "sugar_g",
+    f"{_HK}DietarySodium": "sodium_mg",
 }
+
+# Sodium arrives in grams or milligrams; normalize to mg.
+_TO_MG = {"mg": 1.0, "g": 1000.0, "mcg": 0.001, "µg": 0.001}
 
 # Quantity types stored as generic vitals, keyed by our metric name.
 _VITALS = {
@@ -170,6 +174,12 @@ class _Aggregates:
                     self.skipped += 1
                     return
                 self.nutrition[day][field] += kcal
+            elif field == "sodium_mg":
+                mg = _convert(value, unit, _TO_MG)
+                if mg is None:
+                    self.skipped += 1
+                    return
+                self.nutrition[day][field] += mg
             else:
                 self.nutrition[day][field] += value  # macros arrive in grams
         elif rtype in _VITALS:
@@ -295,6 +305,9 @@ def import_export(
             fat_g=round(sums["fat_g"], 1) if sums.get("fat_g") else None,
             fiber_g=round(sums["fiber_g"], 1) if sums.get("fiber_g") else None,
             sugar_g=round(sums["sugar_g"], 1) if sums.get("sugar_g") else None,
+            sodium_mg=round(sums["sodium_mg"], 1) if sums.get("sodium_mg") else None,
+            source="apple",
+            is_estimated=True,
             note=NOTE_TAG,
         )
     for (day, metric), values in agg.vitals.items():

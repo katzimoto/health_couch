@@ -86,15 +86,31 @@ class Analyzer:
                 break
         return streak
 
-    def sleep_debt(self, rows: list[dict[str, Any]], target_hours: float = 8.0) -> float | None:
-        """Cumulative shortfall vs ``target_hours`` over the last 7 calendar
-        nights. Nights with no sleep data are skipped (watch not worn is not
-        the same as not sleeping), so this is a lower bound."""
+    def sleep_debt(
+        self, rows: list[dict[str, Any]], target_hours: float | None = None
+    ) -> float | None:
+        """Cumulative shortfall vs the user's *configured* sleep target over the
+        last 7 calendar nights — an estimate, not a physiological measurement.
+
+        Per the coaching model, each night's debt is ``max(0, target - actual)``
+        (a long night doesn't "pay back" a short one). The target defaults to
+        the user's configured value (7.0h baseline, never a hard-coded 8) and is
+        resolved *per night* through the effective-dated history, so recomputing
+        an old week after a target change reproduces the original numbers.
+        Nights with no sleep data are skipped (watch not worn ≠ no sleep), so
+        this is a lower bound. Pass ``target_hours`` to override (e.g. tests)."""
         week = _window(rows, 7)
-        hours = [r.get("sleep_hours") for r in week if r.get("sleep_hours") is not None]
-        if not hours:
+        nights = [r for r in week if r.get("sleep_hours") is not None]
+        if not nights:
             return None
-        return round(sum(target_hours - h for h in hours), 1)
+        debt = 0.0
+        for r in nights:
+            target = (
+                target_hours if target_hours is not None
+                else self.db.sleep_target_for(r.get("day"))
+            )
+            debt += max(0.0, target - float(r["sleep_hours"]))
+        return round(debt, 1)
 
     def acute_chronic_ratio(self) -> dict[str, Any]:
         """EWMA acute (7d span) vs chronic (28d span) training load and ratio.
@@ -188,6 +204,7 @@ class Analyzer:
                 "body_fat": self._trend(rows, "body_fat"),
             },
             "sleep_debt_7d": self.sleep_debt(rows),
+            "sleep_target_hours": self.db.sleep_target_for(),
             "training_load": self.acute_chronic_ratio(),
             "flags": self.flags(rows),
             # Subjective check-in, when the user has logged one — lets the
