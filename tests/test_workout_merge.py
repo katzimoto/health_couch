@@ -13,6 +13,7 @@ from datetime import date, timedelta
 import pytest
 
 import garmin_coach.mcp_server as mcp
+from garmin_coach.mcp_tools import runtime
 from garmin_coach.database import Database
 from garmin_coach.models import WorkoutSourceLink
 from garmin_coach.workout_merge import (
@@ -26,7 +27,8 @@ from sqlmodel import select
 @pytest.fixture()
 def db(tmp_path, monkeypatch) -> Database:
     database = Database(path=str(tmp_path / "merge.db"))
-    monkeypatch.setattr(mcp, "db", database)
+    monkeypatch.setattr(runtime, "_db", database)
+    monkeypatch.setattr(runtime, "_garmin", None)
     return database
 
 

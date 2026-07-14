@@ -10,6 +10,7 @@ from datetime import date, timedelta
 import pytest
 
 import garmin_coach.mcp_server as mcp
+from garmin_coach.mcp_tools import runtime
 from garmin_coach.database import Database
 from garmin_coach.training_load import estimate_training_load
 
@@ -19,7 +20,8 @@ def db(tmp_path, monkeypatch) -> Database:
     database = Database(path=str(tmp_path / "coaching.db"))
     # The MCP tools are thin wrappers over module-level handles — point them
     # at the test database so tool-level behaviour can be exercised directly.
-    monkeypatch.setattr(mcp, "db", database)
+    monkeypatch.setattr(runtime, "_db", database)
+    monkeypatch.setattr(runtime, "_garmin", None)
     return database
 
 
@@ -231,8 +233,6 @@ def test_recovery_caution_blocks_increases(db: Database, monkeypatch) -> None:
     db.upsert_readiness(_day(), soreness_1_10=8, energy_1_10=3)
     db.upsert_sleep(_day(), score=70, total_seconds=6 * 3600)
 
-    from garmin_coach.analysis import Analyzer
-    monkeypatch.setattr(mcp, "analyzer", Analyzer(db))
 
     result = mcp.recommend_next_weights(exercises=["Squat"])
     assert "soreness" in result["recovery_caution"]
@@ -251,8 +251,6 @@ def test_recommend_covers_recently_trained_when_unspecified(db: Database, monkey
             {"exercise_name": "Row", "weight_kg": 50, "sets": 3, "reps": 10, "rpe": 8},
         ],
     )
-    from garmin_coach.analysis import Analyzer
-    monkeypatch.setattr(mcp, "analyzer", Analyzer(db))
 
     result = mcp.recommend_next_weights()
     by_name = {r["exercise"]: r for r in result["recommendations"]}
@@ -500,7 +498,7 @@ def test_sync_status_before_any_pull(db: Database) -> None:
 
 def test_sync_garmin_pulls_and_status_reflects_it(db: Database, monkeypatch) -> None:
     fake = _FakeGarmin(db)
-    monkeypatch.setattr(mcp, "_garmin", fake)
+    monkeypatch.setattr(runtime, "_garmin", fake)
 
     result = mcp.sync_garmin()
     assert result["synced"] is True
@@ -520,7 +518,7 @@ def test_sync_cooldown_skips_but_force_and_specific_day_override(
     db: Database, monkeypatch
 ) -> None:
     fake = _FakeGarmin(db)
-    monkeypatch.setattr(mcp, "_garmin", fake)
+    monkeypatch.setattr(runtime, "_garmin", fake)
 
     mcp.sync_garmin()
     repeat = mcp.sync_garmin()  # immediately again — cooldown applies
@@ -536,7 +534,7 @@ def test_sync_cooldown_skips_but_force_and_specific_day_override(
 
 
 def test_sync_failure_is_reported_not_raised(db: Database, monkeypatch) -> None:
-    monkeypatch.setattr(mcp, "_garmin", _FakeGarmin(db, error=RuntimeError("401 unauthorized")))
+    monkeypatch.setattr(runtime, "_garmin", _FakeGarmin(db, error=RuntimeError("401 unauthorized")))
     result = mcp.sync_garmin(force=True)
     assert result["synced"] is False
     assert "401" in result["error"]

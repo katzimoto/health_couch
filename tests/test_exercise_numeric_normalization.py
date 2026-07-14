@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import text
 
 import garmin_coach.mcp_server as mcp
+from garmin_coach.mcp_tools import runtime
 from garmin_coach.database import Database
 from garmin_coach.exercise_metrics import (
     normalize_performance,
@@ -32,10 +33,9 @@ from garmin_coach.progression import recommend_next_weight
 @pytest.fixture()
 def db(tmp_path, monkeypatch) -> Database:
     database = Database(path=str(tmp_path / "normalization.db"))
-    monkeypatch.setattr(mcp, "db", database)
-    from garmin_coach.analysis import Analyzer
-
-    monkeypatch.setattr(mcp, "analyzer", Analyzer(database))
+    # db and analyzer both derive from the runtime db handle.
+    monkeypatch.setattr(runtime, "_db", database)
+    monkeypatch.setattr(runtime, "_garmin", None)
     return database
 
 

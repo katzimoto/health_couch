@@ -10,16 +10,17 @@ import pytest
 
 import garmin_coach.mcp_server as mcp
 from garmin_coach.database import Database
-from garmin_coach.reminders import Reminders
+from garmin_coach.mcp_tools import runtime
 from garmin_coach.workout_flow import WorkoutLogFlows
 
 
 @pytest.fixture()
 def db(tmp_path, monkeypatch) -> Database:
     database = Database(path=str(tmp_path / "top5.db"))
-    monkeypatch.setattr(mcp, "db", database)
-    monkeypatch.setattr(mcp, "reminders", Reminders(database))
-    monkeypatch.setattr(mcp, "workout_log_flows", WorkoutLogFlows(database))
+    # Point the lazy runtime handles (db/analyzer/reminders/workout_log_flows
+    # all derive from this) at the throwaway test database.
+    monkeypatch.setattr(runtime, "_db", database)
+    monkeypatch.setattr(runtime, "_garmin", None)
     return database
 
 
@@ -133,7 +134,7 @@ def test_reminder_pack_does_not_collide_across_different_dated_plans(db: Databas
     assert set(ids_a.values()).isdisjoint(ids_b.values())
     assert all(r["deduplicated"] is False for r in result_b["reminders"])
 
-    gym_start_b = mcp.reminders.get(ids_b["gym_start"])
+    gym_start_b = runtime.reminders.get(ids_b["gym_start"])
     assert gym_start_b["date"] == _day(3)  # not silently left on plan_a's date
 
 
@@ -569,7 +570,7 @@ def test_start_workout_log_flow_tool_pushes_prompt(db: Database, monkeypatch) ->
         sent["message"] = message
         return 42
 
-    monkeypatch.setattr(mcp, "send_telegram_message", fake_send)
+    monkeypatch.setattr(runtime, "send_telegram_message", fake_send)
     result = mcp.start_workout_log_flow(plan["id"])
     assert result["flow_id"] is not None
     assert "complete the workout" in sent["message"]

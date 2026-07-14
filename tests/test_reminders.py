@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 import garmin_coach.mcp_server as mcp
+from garmin_coach.mcp_tools import runtime
 import garmin_coach.scheduler as scheduler_mod
 from garmin_coach.database import Database
 from garmin_coach.reminders import (
@@ -414,8 +415,8 @@ def test_bot_workout_done_without_plan(bot: TelegramCoach) -> None:
 
 @pytest.fixture()
 def mcp_env(db, monkeypatch) -> Database:
-    monkeypatch.setattr(mcp, "db", db)
-    monkeypatch.setattr(mcp, "reminders", Reminders(db))
+    monkeypatch.setattr(runtime, "_db", db)
+    monkeypatch.setattr(runtime, "_garmin", None)
     return db
 
 
@@ -456,7 +457,7 @@ def test_mcp_edit_unknown_id(mcp_env) -> None:
 
 
 def test_mcp_send_now_records_delivery(mcp_env, monkeypatch) -> None:
-    monkeypatch.setattr(mcp, "send_telegram_message", lambda text: 555)
+    monkeypatch.setattr(runtime, "send_telegram_message", lambda text: 555)
     result = mcp.send_telegram_message_now("hello", tags=["nudge"])
     assert result == {"sent": True, "telegram_message_id": 555}
     delivery = mcp.get_reminder_deliveries()[0]
@@ -469,7 +470,7 @@ def test_mcp_send_now_failure_is_recorded(mcp_env, monkeypatch) -> None:
     def _fail(text):
         raise RuntimeError("no chat id")
 
-    monkeypatch.setattr(mcp, "send_telegram_message", _fail)
+    monkeypatch.setattr(runtime, "send_telegram_message", _fail)
     result = mcp.send_telegram_message_now("hello")
     assert result["sent"] is False
     assert mcp.get_reminder_deliveries()[0]["status"] == "error"
