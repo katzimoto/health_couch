@@ -50,6 +50,7 @@ from .reminders import DEFAULT_TIMEZONE, Reminders
 from .swimming import build_swimming_progress
 from .strength_progress import build_strength_progress
 from .sport_load import build_sport_training_load
+from .progress_report import build_training_progress_report
 from .telegram_sender import send_telegram_message
 from .training_load import estimate_training_load
 from .workout_flow import WorkoutLogFlows
@@ -166,6 +167,46 @@ def get_sport_training_load(days: int = 28, sport: str | None = None) -> dict:
 
 
 # ── Progression analytics ───────────────────────────────────────────────────────
+
+@mcp.tool
+def get_training_progress_report(
+    days: int = 56,
+    baseline_days: int | None = None,
+    detail: bool = False,
+) -> dict:
+    """THE "how am I progressing?" call: one baseline-relative report covering
+    every recorded sport plus strength, adherence and recovery.
+
+    Composed from the deterministic analytics services (activity, swimming,
+    strength, training load, data quality) — not from an LLM re-deriving numbers
+    from raw logs — so its totals match the individual endpoints for the same
+    window.
+
+    Returns the explicit analysis and comparison windows with the baseline's
+    selection method, sync coverage, and sections for ``sports`` (every activity
+    type recorded in the window, so swimming or another major sport can never be
+    silently omitted), ``swimming`` (active vs elapsed pace, rest, efficiency,
+    continuous bests), ``strength`` (per-exercise records and progression with
+    load conventions preserved), ``adherence`` (TrainingPlan statuses with an
+    explicit denominator — no recorded plan means unknown, never zero),
+    ``recovery`` (reused from the existing analyzer, as context and not as a
+    cause), ``notable_prs`` (each labelled observation or estimate, with source
+    ids), ``concerns`` (declines, effort-confounded improvements, thin samples,
+    incomplete recordings, unresolved reconciliation, sparse coverage) and
+    ``data_quality``.
+
+    Comparisons are against the user's own preceding window of equal length — no
+    population rankings and no forecasts — and no blended "overall fitness +X%"
+    number is produced. ``detail=True`` adds full per-sport progression, the
+    per-exercise strength history and the sport load breakdown for drill-down;
+    the default is the bounded summary."""
+    return build_training_progress_report(
+        db,
+        days=max(1, min(days, 730)),
+        baseline_days=baseline_days,
+        detail=detail,
+    )
+
 
 @mcp.tool
 def get_activity_progress(
@@ -382,6 +423,7 @@ def get_today_coaching_context(
     day: str | None = None,
     refresh_if_stale: bool = True,
     include_recommendation: bool = True,
+    include_progress_summary: bool = False,
 ) -> dict:
     """THE daily-coaching call: everything needed to answer "based on all my
     current data, what should I do today?" in one structured payload.
@@ -399,13 +441,19 @@ def get_today_coaching_context(
     With ``refresh_if_stale`` (default true) a stale Garmin sync (>90 min) is
     refreshed first; if Garmin is unreachable the latest cached data is used and
     the failure is reported under data_freshness.refresh rather than returning a
-    generic "connector unavailable"."""
+    generic "connector unavailable".
+
+    ``include_progress_summary`` attaches a bounded summary of
+    ``get_training_progress_report`` under ``progress_summary`` — the same
+    deterministic numbers, so the coach cites the progress report rather than
+    re-deriving trends from raw rows."""
     return build_coaching_context(
         db,
         day=day,
         refresh_if_stale=refresh_if_stale,
         include_recommendation=include_recommendation,
         garmin_sync=_refresh_today_from_garmin if refresh_if_stale else None,
+        include_progress_summary=include_progress_summary,
     )
 
 
