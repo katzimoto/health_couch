@@ -31,6 +31,7 @@ from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.auth.providers.workos import AuthKitProvider
 
+from .activity_progress import build_activity_progress, recorded_activity_types
 from .analysis import Analyzer
 from .coaching_context import build_coaching_context
 from .config import settings
@@ -46,6 +47,8 @@ from .nutrition_gaps import (
 )
 from .progression import recommend_next_weight, recovery_caution
 from .reminders import DEFAULT_TIMEZONE, Reminders
+from .swimming import build_swimming_progress
+from .strength_progress import build_strength_progress
 from .telegram_sender import send_telegram_message
 from .training_load import estimate_training_load
 from .workout_flow import WorkoutLogFlows
@@ -121,6 +124,174 @@ def get_training_load(days: int = 28) -> dict:
         "recent_workouts": db.recent_workouts(days=days),
         "merged_workouts": db.merged_workout_summaries(days=days),
     }
+
+
+# ── Progression analytics ───────────────────────────────────────────────────────
+
+@mcp.tool
+def get_activity_progress(
+    type: str,
+    days: int = 90,
+    baseline_days: int | None = None,
+    include_sessions: bool = False,
+) -> dict:
+    """Progression for one sport over ``days`` — the generic per-activity view.
+
+    ``type`` is an activity type key as recorded by Garmin (``"running"``,
+    ``"lap_swimming"``, ``"cycling"``, ``"walking"``, ``"rowing"``,
+    ``"strength_training"``, …); common spellings are normalised. Materially
+    different modalities stay separate: pool vs open-water swimming, indoor vs
+    outdoor cycling and treadmill vs road running are never pooled, and
+    ``related_types_not_included`` names the siblings you can ask for
+    separately.
+
+    Returns the explicit analysis and baseline windows (calendar days in your
+    timezone), workout count and sessions/week, weekly distance/duration/load,
+    average session duration and distance, weighted pace or speed (derived from
+    total distance ÷ total time, never an average of per-session paces),
+    heart-rate context with its coverage, the longest session, observed
+    session-level records, absolute and percentage changes vs the preceding
+    equal-length baseline, per-calendar-week series with partial weeks marked,
+    least-squares weekly trends, sync coverage, and data-quality exclusions.
+
+    Metrics that do not apply to a sport come back null with an explicit
+    reason — never a fabricated value. Strength and swimming additionally name
+    the specialist tool (``get_strength_progress`` / ``get_swimming_progress``)
+    that models their exercise- or length-level detail.
+    """
+    return build_activity_progress(
+        db,
+        type,
+        days=days,
+        baseline_days=baseline_days,
+        include_sessions=include_sessions,
+    )
+
+
+@mcp.tool
+def get_swimming_progress(
+    days: int = 90,
+    pool_length_m: float | None = None,
+    stroke: str | None = None,
+    min_distance_m: float | None = None,
+    include_sessions: bool = False,
+) -> dict:
+    """Swimming progression over ``days`` — the call that distinguishes faster
+    swimming from shorter rests, greater effort and better stroke efficiency.
+
+    Reports **active pace and elapsed pace as separate series** (with their own
+    sample counts), rest time and its derivation, sessions/week, weekly distance
+    and duration, stroke-efficiency metrics grouped by pool length *and* stroke
+    (never pooled across them), the longest session, and best continuous
+    50/100/200/400 m efforts computed only from contiguous recorded lengths —
+    never interpolated from a whole-session average and never bridged across a
+    rest or a recording gap.
+
+    A session recorded with elapsed time only is labelled as such and gets no
+    invented active pace, SWOLF, efficiency or continuous PR. Pool and
+    open-water swims are reported separately under ``by_modality``. Optional
+    filters narrow to a comparable set and report what they excluded.
+
+    Sessions recorded before swim-detail ingestion existed appear under
+    ``data_quality.sessions_without_detail_ingested``; run
+    ``backfill_swim_details`` to fill them in.
+    """
+    return build_swimming_progress(
+        db,
+        days=days,
+        pool_length_m=pool_length_m,
+        stroke=stroke,
+        min_distance_m=min_distance_m,
+        include_sessions=include_sessions,
+    )
+
+
+@mcp.tool
+def backfill_swim_details(days: int = 365, limit: int = 25, retry_errors: bool = False) -> dict:
+    """Ingest per-length/split detail for swims recorded before detail
+    ingestion existed (or that previously failed).
+
+    Bounded and resumable: at most ``limit`` activities per call, skipping any
+    already asked about, so a long history fills in gradually without
+    re-triggering Garmin's rate limiting. Repeated runs are idempotent —
+    detail is refreshed and lengths are replaced, never duplicated.
+    ``remaining`` in the response says how much is left to do."""
+    return _garmin_client().pull_activity_details(
+        days=max(1, min(days, 3650)),
+        limit=max(1, min(limit, 200)),
+        retry_errors=retry_errors,
+    )
+
+
+@mcp.tool
+def get_strength_progress(
+    exercise: str | None = None,
+    days: int = 120,
+    include_sessions: bool = True,
+) -> dict:
+    """Longitudinal strength progression — how a lift has actually moved.
+
+    With ``exercise`` set: per-session actual sets, reps, weight, best set,
+    completed volume, available RPE/RIR, training frequency and session IDs,
+    plus observed records, progression rate and estimated-1RM trend.
+
+    Volume is **exact** — Σ(reps × weight) over the recorded sets. A top-weight
+    aggregate is never multiplied by all reps; sessions with only aggregate
+    columns are labelled ``volume_basis: "aggregate_estimate"``. A weight record
+    says whether the weight was carried across every working set or only on a
+    top set. Estimated 1RM (Epley) is only produced from a completed set inside
+    1–10 reps and is always labelled an estimate, never a measured max.
+
+    Load conventions are explicit: per-hand dumbbell load, total barbell load, a
+    machine stack, added bodyweight and assisted loads are reported with their
+    convention, and ``unknown`` stays unknown rather than being assumed.
+    Equipment variants are kept separate — the same movement on two machines is
+    two progressions. Skipped and substituted work never inflates completed
+    volume, and rows whose stored values couldn't be read are excluded from
+    records with the exclusion reported.
+
+    Without ``exercise``: a bounded summary of every exercise trained in the
+    window."""
+    return build_strength_progress(
+        db,
+        exercise=exercise,
+        days=days,
+        include_sessions=include_sessions,
+    )
+
+
+@mcp.tool
+def get_workout_data_quality(days: int = 90) -> dict:
+    """Read-only data-quality report over recorded workouts.
+
+    Typed findings with severity, the activity (and any related source), the
+    evidence behind the finding and a suggested action:
+
+    * ``near_zero_duration`` — a recording far too short to be a whole session;
+    * ``partial_recording`` — a device recording covering only part of a session
+      another source recorded in full, so its heart rate, calories and load
+      describe a slice, not the session;
+    * ``zero_distance`` / ``impossible_speed`` / ``impossible_time_distance`` —
+      physically inconsistent distance and time;
+    * ``missing_essential_data`` — neither duration nor distance recorded;
+    * ``source_field_mismatch`` — two sources of one session disagree;
+    * ``unresolved_match_candidate`` — two records that *may* be one session but
+      lack sufficient timing/duration evidence; they are left separate, never
+      merged on a shared date alone.
+
+    Nothing is modified by this call. To act on a finding, preview with
+    ``merge_workout_sources(..., dry_run=True)`` and then apply it explicitly;
+    ``unmerge_workout_sources`` reverses a bad match. ``records_blocked_activity_ids``
+    lists the sessions the progression reports keep out of records and totals."""
+    return db.workout_data_quality(days=max(1, min(days, 3650)))
+
+
+@mcp.tool
+def get_recorded_activity_types(days: int = 90) -> list[dict]:
+    """Every activity type actually recorded in the last ``days``, with its
+    canonical key, family, session count and the raw type strings seen — so a
+    sport the user does can be discovered rather than guessed at."""
+    return recorded_activity_types(db, days=days)
 
 
 @mcp.tool

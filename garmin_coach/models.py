@@ -134,6 +134,78 @@ class WorkoutSourceLink(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
+class ActivityDetail(SQLModel, table=True):
+    """Per-activity detail beyond the daily activity *summary* Garmin returns.
+
+    One row per activity we successfully (or unsuccessfully) asked for detail
+    about, keyed by the same ``activity_id`` as :class:`Workout`. It exists so
+    swim analytics can be truthful about time: Garmin reports *elapsed*,
+    *timer* and *moving/active* durations separately and they are not
+    interchangeable — rest between intervals is the difference, and deriving it
+    any other way would be a guess.
+
+    ``status`` makes the historical backfill resumable and bounded: ``ok``,
+    ``empty`` (provider returned nothing), ``unsupported`` (this
+    garminconnect/device combination does not expose the endpoint) or
+    ``error``. A row is written either way, so a resumed backfill skips
+    activities it has already asked about instead of hammering the same
+    failures.
+    """
+
+    __tablename__ = "activity_detail"
+    activity_id: int = Field(primary_key=True)
+    day: str = Field(index=True)
+    activity_type: Optional[str] = None
+    status: str = "ok"  # ok | empty | unsupported | error
+    detail_source: Optional[str] = None  # which provider call produced this
+    error: Optional[str] = None
+    # Time semantics — never interchangeable, never derived from one another.
+    elapsed_duration_s: Optional[float] = None
+    timer_duration_s: Optional[float] = None
+    active_duration_s: Optional[float] = None
+    rest_duration_s: Optional[float] = None
+    rest_source: Optional[str] = None  # how rest was derived, when it was
+    # Pool/stroke context.
+    pool_length_m: Optional[float] = None
+    pool_length_raw: Optional[float] = None
+    pool_length_unit: Optional[str] = None  # meter | yard | ...
+    primary_stroke: Optional[str] = None
+    stroke_mix: Optional[str] = None  # JSON {stroke: lengths} when mixed
+    total_lengths: Optional[int] = None
+    active_lengths: Optional[int] = None
+    total_strokes: Optional[int] = None
+    avg_swolf: Optional[float] = None
+    avg_stroke_distance_m: Optional[float] = None
+    avg_stroke_rate: Optional[float] = None
+    length_count: Optional[int] = None  # rows actually stored in activity_length
+    fetched_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class ActivityLength(SQLModel, table=True):
+    """One recorded length/split of an activity (a pool length, a lap).
+
+    Stored verbatim from the provider so continuous-effort bests can be
+    computed over *contiguous* lengths only — never interpolated from a
+    whole-session average and never bridged across a rest or a recording gap.
+    ``is_rest`` marks an interval the provider itself reported as rest.
+    """
+
+    __tablename__ = "activity_length"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    activity_id: int = Field(index=True)
+    length_index: int
+    start_time: Optional[str] = None
+    duration_s: Optional[float] = None
+    distance_m: Optional[float] = None
+    stroke: Optional[str] = None
+    strokes: Optional[int] = None
+    swolf: Optional[float] = None
+    avg_hr: Optional[int] = None
+    is_rest: bool = False
+    split_type: Optional[str] = None
+
+
 class Weight(SQLModel, table=True):
     day: str = Field(primary_key=True)
     weight_kg: Optional[float] = None
