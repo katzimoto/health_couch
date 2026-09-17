@@ -49,6 +49,7 @@ from .progression import recommend_next_weight, recovery_caution
 from .reminders import DEFAULT_TIMEZONE, Reminders
 from .swimming import build_swimming_progress
 from .strength_progress import build_strength_progress
+from .sport_load import build_sport_training_load
 from .telegram_sender import send_telegram_message
 from .training_load import estimate_training_load
 from .workout_flow import WorkoutLogFlows
@@ -111,19 +112,57 @@ def get_sleep_trend(days: int = 30) -> dict:
 
 
 @mcp.tool
-def get_training_load(days: int = 28) -> dict:
+def get_training_load(days: int = 28, by_sport: bool = False) -> dict:
     """EWMA-weighted acute (7d) vs chronic (28d) training load, their ratio,
     and recent workouts (duplicates excluded). Ratio >1.5 = spike, <0.8 =
     detraining. Each workout's ``load_source`` says whether its load is
     garmin-provided, estimated (documented heuristic), or manually entered.
     A merged workout (manual strength + Garmin activity) counts once, with the
     Garmin load when available; ``merged_workouts`` lists these with their
-    field provenance."""
-    return {
+    field provenance.
+
+    Pass ``by_sport=True`` to add a per-sport decomposition of the *same* load
+    metric (see ``get_sport_training_load``) under ``sport_breakdown``; the
+    existing keys are unchanged either way."""
+    result = {
         "acute_chronic": analyzer.acute_chronic_ratio(),
         "recent_workouts": db.recent_workouts(days=days),
         "merged_workouts": db.merged_workout_summaries(days=days),
     }
+    if by_sport:
+        result["sport_breakdown"] = build_sport_training_load(db, days=days)
+    return result
+
+
+@mcp.tool
+def get_sport_training_load(days: int = 28, sport: str | None = None) -> dict:
+    """Training load broken down by sport, over the same metric as
+    ``get_training_load``.
+
+    ``by_sport`` gives, per activity type: session count and sessions/week,
+    duration and (where meaningful) distance, total and weekly load, the load's
+    provenance split (``load_by_source``: device EPOC value vs the documented
+    estimate vs manual — reported separately because they are not the same
+    measurement), a per-sport acute:chronic pair computed with the same EWMA
+    spans as the overall metric, and per-sport coverage.
+
+    A sport whose own history is too short, or whose chronic load is zero,
+    returns an unavailable ratio **with a reason** rather than a divide by zero.
+    ``reconciliation`` proves the sport buckets sum to the reported total;
+    strength's supplemental workload (session frequency, completed working sets,
+    kg × reps volume) is a separate, deliberately non-additive block that stays
+    visible even when the device recorded no heart rate or load.
+
+    ``rest_and_coverage`` distinguishes confirmed rest (a day that synced with
+    no session) from unknown days (no recorded sync at all), and
+    ``data_quality`` lists recordings excluded as incomplete or inconsistent.
+
+    Acute:chronic figures here are descriptive monitoring signals over your own
+    history — not injury predictions, and not universal safe/unsafe thresholds.
+
+    Pass ``sport`` (e.g. "lap_swimming", "running", "strength_training") to
+    narrow to one activity type."""
+    return build_sport_training_load(db, days=max(1, min(days, 730)), sport=sport)
 
 
 # ── Progression analytics ───────────────────────────────────────────────────────

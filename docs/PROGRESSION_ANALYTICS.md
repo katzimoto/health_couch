@@ -362,3 +362,68 @@ pace and records, and reports them under
 never force-merges and never writes; a test asserts storage is byte-identical
 before and after. Applying a fix is a separate, explicit call with `dry_run`
 available to preview it.
+
+## `get_sport_training_load(days=28, sport=None)` / `get_training_load(days, by_sport=True)`
+
+Per-sport decomposition of the training-load metric — `garmin_coach/sport_load.py`.
+
+`get_training_load(days)` is unchanged: same keys, same acute:chronic numbers.
+`by_sport=True` adds a `sport_breakdown` block; the dedicated tool returns that
+block alone.
+
+### It is a decomposition, not a second metric
+
+Per-sport load is the same `Workout.training_load` column, bucketed with the
+same normalizer `get_activity_progress` uses. So:
+
+* `reconciliation.sum_of_sport_load == reconciliation.reported_total_load`
+  (asserted by a test, and reported as `reconciles` in every unfiltered call);
+* the per-sport acute:chronic pair uses the **same** EWMA spans (7 d / 28 d) and
+  the same seeding rule as `Analyzer.acute_chronic_ratio`, so a single-sport
+  history produces the same ratio in both views;
+* anything not on that scale — strength working sets, kg × reps volume — lives
+  in a separate `strength_workload` block listed under
+  `reconciliation.not_summed` and is never added in.
+
+### Per sport
+
+| Field | Notes |
+| --- | --- |
+| `session_count`, `sessions_per_week` | Canonical workouts only; merged sessions count once. |
+| `total_duration_s`, `weekly_duration_s` | Always available. |
+| `total_distance_m`, `weekly_distance_m` | `null` + `distance_unavailable_reason` where distance isn't meaningful. |
+| `total_training_load`, `weekly_training_load` | The bucketed legacy metric. |
+| `load_by_source` | `garmin` (device EPOC) vs `estimated` (documented heuristic) vs `manual`, with session counts and `sessions_without_load`. Different methods, reported separately. |
+| `acute_chronic` | Per-sport EWMA pair + ratio, or `unavailable_reason`. |
+| `coverage` | Sessions with a load value vs total — a session without one is **missing data, not zero load**. |
+| `excluded_activity_ids` | Recordings the quality detector flagged as unusable. |
+
+A sport whose own history spans fewer than `SPORT_MIN_HISTORY_DAYS` (21) days,
+or whose chronic load is zero, returns `ratio: null` with the reason — never a
+divide by zero and never a number borrowed from the overall series.
+
+### Strength
+
+`strength_workload` reports session frequency, `completed_working_sets`,
+`exercises_performed`, `completed_volume_kg` (exact per-set where the data
+supports it, `volume_basis` says which) and `weekly_volume_kg`, with units
+spelled out. It is computed from the logged sets, so **strength workload stays
+visible when the device recorded no HR and no load at all**.
+
+### Rest vs missing sync
+
+`rest_and_coverage` separates:
+
+* `active_days` — a session was recorded;
+* `confirmed_rest_days` — the day synced successfully and had no session;
+* `unknown_days` — no recorded sync at all, so nothing can be concluded.
+
+### Limitations
+
+* Acute:chronic is a descriptive monitoring signal over the user's own history —
+  **not** an injury prediction and not a universal safe/unsafe threshold. Every
+  ratio carries that note.
+* Optional session-RPE × duration is deliberately *not* synthesised: the repo's
+  estimator already documents its inputs, and inventing an RPE or deriving a
+  full-session load from a truncated recording is exactly what the quality
+  detector exists to prevent.
