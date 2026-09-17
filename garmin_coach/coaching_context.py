@@ -327,37 +327,18 @@ def build_recommendation(
 def detect_workout_quality_warnings(workouts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Flag physiologically suspicious workout rows (never delete them).
 
-    Catches the cases the mission calls out: zero distance on a running/walking
-    activity, implausible average speed, and distance grossly inconsistent with
-    duration. Each warning names the activity and field so a human can correct
-    it; sensitive calculations can choose to exclude flagged rows.
+    Thin wrapper over :mod:`~garmin_coach.workout_quality`, which is the single
+    detection pipeline: zero distance on a distance sport, implausible speed,
+    near-zero durations, partial recordings and inconsistent sources all come
+    from one detector, mapped here into the ``{activity_id, field, status,
+    reason, action}`` shape this function has always returned. Sensitive
+    calculations can choose to exclude flagged rows; the richer typed findings
+    (with evidence and suggested actions) are available through
+    ``get_workout_data_quality``.
     """
-    warnings: list[dict[str, Any]] = []
-    for w in workouts:
-        aid = w.get("activity_id")
-        wtype = (w.get("type") or "").lower()
-        dist = _num(w.get("distance_m"))
-        dur = _num(w.get("duration_s"))
-        is_distance_sport = any(
-            k in wtype for k in ("run", "walk", "cycl", "bike", "row", "swim")
-        )
-        if is_distance_sport and dur and dur > 300 and (dist is None or dist == 0):
-            warnings.append({
-                "activity_id": aid, "field": "distance_m", "status": "suspicious",
-                "reason": f"{wtype or 'distance'} activity of {dur/60:.0f} min has zero/no distance",
-                "action": "excluded_from_pace_calcs",
-            })
-        if dist and dur and dur > 0:
-            speed_ms = dist / dur
-            # >12.5 m/s (~45 km/h) is faster than a human runs/rides casually.
-            if speed_ms > 12.5 and "cycl" not in wtype and "bike" not in wtype:
-                warnings.append({
-                    "activity_id": aid, "field": "distance_m/duration_s",
-                    "status": "suspicious",
-                    "reason": f"implausible average speed {speed_ms*3.6:.0f} km/h",
-                    "action": "flag_for_review",
-                })
-    return warnings
+    from .workout_quality import detect_findings, findings_to_warnings
+
+    return findings_to_warnings(detect_findings(workouts))
 
 
 def _staleness(last_pull: dict[str, Any] | None) -> dict[str, Any]:

@@ -48,6 +48,7 @@ from .nutrition_gaps import (
 from .progression import recommend_next_weight, recovery_caution
 from .reminders import DEFAULT_TIMEZONE, Reminders
 from .swimming import build_swimming_progress
+from .strength_progress import build_strength_progress
 from .telegram_sender import send_telegram_message
 from .training_load import estimate_training_load
 from .workout_flow import WorkoutLogFlows
@@ -220,6 +221,69 @@ def backfill_swim_details(days: int = 365, limit: int = 25, retry_errors: bool =
         limit=max(1, min(limit, 200)),
         retry_errors=retry_errors,
     )
+
+
+@mcp.tool
+def get_strength_progress(
+    exercise: str | None = None,
+    days: int = 120,
+    include_sessions: bool = True,
+) -> dict:
+    """Longitudinal strength progression — how a lift has actually moved.
+
+    With ``exercise`` set: per-session actual sets, reps, weight, best set,
+    completed volume, available RPE/RIR, training frequency and session IDs,
+    plus observed records, progression rate and estimated-1RM trend.
+
+    Volume is **exact** — Σ(reps × weight) over the recorded sets. A top-weight
+    aggregate is never multiplied by all reps; sessions with only aggregate
+    columns are labelled ``volume_basis: "aggregate_estimate"``. A weight record
+    says whether the weight was carried across every working set or only on a
+    top set. Estimated 1RM (Epley) is only produced from a completed set inside
+    1–10 reps and is always labelled an estimate, never a measured max.
+
+    Load conventions are explicit: per-hand dumbbell load, total barbell load, a
+    machine stack, added bodyweight and assisted loads are reported with their
+    convention, and ``unknown`` stays unknown rather than being assumed.
+    Equipment variants are kept separate — the same movement on two machines is
+    two progressions. Skipped and substituted work never inflates completed
+    volume, and rows whose stored values couldn't be read are excluded from
+    records with the exclusion reported.
+
+    Without ``exercise``: a bounded summary of every exercise trained in the
+    window."""
+    return build_strength_progress(
+        db,
+        exercise=exercise,
+        days=days,
+        include_sessions=include_sessions,
+    )
+
+
+@mcp.tool
+def get_workout_data_quality(days: int = 90) -> dict:
+    """Read-only data-quality report over recorded workouts.
+
+    Typed findings with severity, the activity (and any related source), the
+    evidence behind the finding and a suggested action:
+
+    * ``near_zero_duration`` — a recording far too short to be a whole session;
+    * ``partial_recording`` — a device recording covering only part of a session
+      another source recorded in full, so its heart rate, calories and load
+      describe a slice, not the session;
+    * ``zero_distance`` / ``impossible_speed`` / ``impossible_time_distance`` —
+      physically inconsistent distance and time;
+    * ``missing_essential_data`` — neither duration nor distance recorded;
+    * ``source_field_mismatch`` — two sources of one session disagree;
+    * ``unresolved_match_candidate`` — two records that *may* be one session but
+      lack sufficient timing/duration evidence; they are left separate, never
+      merged on a shared date alone.
+
+    Nothing is modified by this call. To act on a finding, preview with
+    ``merge_workout_sources(..., dry_run=True)`` and then apply it explicitly;
+    ``unmerge_workout_sources`` reverses a bad match. ``records_blocked_activity_ids``
+    lists the sessions the progression reports keep out of records and totals."""
+    return db.workout_data_quality(days=max(1, min(days, 3650)))
 
 
 @mcp.tool

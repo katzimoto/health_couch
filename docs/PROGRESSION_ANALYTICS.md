@@ -208,3 +208,157 @@ not pool across pools.
 * Sessions recorded before detail ingestion existed report elapsed time only
   until `backfill_swim_details` has run over them; they are listed under
   `data_quality.sessions_without_detail_ingested`.
+
+## `get_strength_progress(exercise=None, days=120, include_sessions=True)`
+
+Longitudinal strength progression — `garmin_coach/strength_progress.py`, built
+on the existing strength tables and `exercise_metrics.normalize_performance`
+(so a legacy `"3"`, a rep range `"10-12"` or a JSON list degrades to `None` with
+a data-quality note instead of crashing or being guessed at).
+
+With `exercise` set it returns the per-session history, records, progression and
+data-quality report for one lift. Without it, a bounded per-exercise summary of
+everything trained in the window.
+
+### Volume
+
+| Case | `volume_basis` | Formula |
+| --- | --- | --- |
+| Per-set data recorded | `per_set` | `Σ(reps × weight)` over the recorded sets — **exact**, so 10×60 + 8×70 + 6×80 = 1640 kg, not 80 × 24. |
+| Aggregate columns only | `aggregate_estimate` | Carried from `exercise_history` and labelled; sets at different weights are not distinguishable in such a record. |
+| Skipped / substituted | `null` | Excluded from completed volume entirely. |
+
+A set whose reps or weight cannot be read is not counted as completed work.
+
+### Top set vs working weight
+
+`top_set_weight_kg` is the heaviest set; `working_weight_kg` is the weight
+carried across **every** working set; `all_sets_at_top_weight` distinguishes the
+two. A weight record reports its `scope` accordingly — *"carried across every
+working set"* vs *"top set only"* — so adding a heavier single is never
+presented as moving the whole session up.
+
+### Records
+
+Observed over the user's own logged sessions only:
+`heaviest_weight_kg`, `highest_volume_kg`, `most_reps_in_a_set` (with the note
+that more reps at a lighter weight is not a heavier lift) and
+`best_estimated_1rm`. Sessions that were skipped, substituted or whose stored
+values couldn't be read are listed under `excluded_sessions` — reported, not
+silently dropped.
+
+### Estimated 1RM
+
+Epley, `weight × (1 + reps / 30)`, produced **only** from a completed set of
+1–10 reps and always flagged `is_estimate: true` with the formula named. Outside
+that range the value is `null` with a reason. It is not a measured maximum.
+
+### Aliases, equipment and load conventions
+
+Normalization folds case, spacing, punctuation and a short list of unambiguous
+abbreviations (`DB` → dumbbell, `OHP` → overhead press, `pull-ups` → pullup).
+Plural folding is deliberately timid (`press` and `lats` keep their ending).
+Nothing that changes the movement or the equipment folds: *incline dumbbell
+press* ≠ *dumbbell press*, and the same movement on two machines is two
+progressions (`equipment_variants` + an explicit note).
+
+`load_convention` names how the number should be read:
+
+| Convention | Meaning |
+| --- | --- |
+| `per_hand` | Dumbbell/kettlebell — not comparable with a barbell total. |
+| `total_load` | Total external load including the bar. |
+| `machine_stack` | Specific to that machine's leverage; never comparable with free weights or a different machine. |
+| `bodyweight` | Any recorded weight is *added* load. |
+| `assisted` | A larger number means an *easier* set. |
+| `unknown` | The log doesn't say — reported as recorded, never assumed. |
+
+### Progression
+
+Change from the earliest to the latest usable session in the window (absolute,
+percentage, with dates). `percent_change` is withheld on a zero or missing
+baseline. A `rate` (least-squares slope of top-set weight per week) needs at
+least `MIN_SESSIONS_FOR_RATE` (3) usable sessions; below that it is `null` with
+a reason rather than noise. Fewer than two sessions → no progression claimed at
+all.
+
+### Limitations
+
+* Records are the user's own observed bests in the window — not population
+  rankings, not forecasts.
+* A volume change that mixes exact per-set sessions with aggregate estimates is
+  flagged `mixed_basis` with a caveat.
+* Existing `get_exercise_history` and `recommend_next_weights` are untouched and
+  remain the write/recommendation path.
+
+## `get_workout_data_quality(days=90)`
+
+Read-only data-quality report — `garmin_coach/workout_quality.py`.
+
+This is the **single** warning pipeline. The detector that
+`coaching_context.detect_workout_quality_warnings` exposed (zero distance,
+implausible speed) is now a legacy-shaped wrapper over `detect_findings`, so
+there is one place to extend and no competing pipelines.
+
+### Finding types
+
+| Type | Severity | Meaning |
+| --- | --- | --- |
+| `near_zero_duration` | warning | A recording shorter than `NEAR_ZERO_DURATION_S` (120 s) — a mis-start, not a session. |
+| `partial_recording` | critical | A recording covering < `PARTIAL_COVERAGE_RATIO` (50%) of the session another source recorded. Its HR/calories/load describe a slice. |
+| `zero_distance` | warning | A distance sport of > 5 min with no distance. |
+| `impossible_speed` | critical | Average speed above ~45 km/h on a non-cycling activity. |
+| `impossible_time_distance` | warning | A distance with no duration — no pace derivable. |
+| `missing_essential_data` | warning | Neither duration nor distance recorded. |
+| `source_field_mismatch` | warning | Two sources of one session disagree materially about a field. |
+| `unresolved_match_candidate` | info/warning | Two records that *may* be one session, left separate for want of evidence. |
+
+Every finding carries `evidence` (the actual numbers), `related_activity_ids`,
+a `suggested_action` and `blocks_records`.
+
+### Matching is evidence-based
+
+`_plausibly_same_session` requires different sources and a compatible type;
+timing and duration then raise or lower `match_confidence`. **A shared date is
+never sufficient** — two runs twelve hours apart are reported as an unresolved
+candidate with their evidence, never merged. Resolving one is an explicit,
+separate call (`merge_workout_sources(source_activity_ids=[…])`), reversible
+with `unmerge_workout_sources`.
+
+### Quality-aware merging
+
+`workout_quality.source_quality(sources)` marks a source *incomplete* when its
+duration covers less than half the longest duration recorded for the same
+session. `workout_merge.merge_fields(sources, is_strength, quality=…)` then
+demotes an incomplete source below any complete one for the **whole-session**
+domains — `duration`, `calories`, `training_load` — whatever the usual domain
+priority says. So for the issue's example:
+
+| Field | Without quality awareness | With it |
+| --- | --- | --- |
+| `duration_s` | 11 s (Garmin, by priority) | 3300 s (manual) |
+| `calories` | 3 | 320 |
+| `training_load` | 1.0 | 75.0 |
+| `avg_hr` | 92 (Garmin) | 92 (Garmin) — **kept**, annotated `covers: "partial"` |
+
+Partial physiology is preserved rather than discarded: it is real data about the
+slice it covers. `coverage_annotations` records the per-field coverage, it is
+stored on the canonical's `meta_json`, and `get_merged_workout` surfaces it as
+`field_coverage`. A *complete* Garmin recording still wins physiology, duration
+and load exactly as before — quality awareness only fires on demonstrably
+incomplete data.
+
+### Feeding the progression APIs
+
+`record_blocking_ids(findings)` is the set of sessions that cannot create a
+record or a headline total. `get_activity_progress` excludes them from totals,
+pace and records, and reports them under
+`data_quality.excluded_from_distance_and_pace` plus `records.excluded_activity_ids`
+— exclusions are reported, never silent data loss.
+
+### Read-only by construction
+
+`get_workout_data_quality` takes rows and returns findings. It never merges,
+never force-merges and never writes; a test asserts storage is byte-identical
+before and after. Applying a fix is a separate, explicit call with `dry_run`
+available to preview it.

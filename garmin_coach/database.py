@@ -75,8 +75,10 @@ from .models import (
     WorkoutSourceLink,
 )
 from .training_load import estimate_training_load
+from .workout_quality import quality_report, source_quality
 from .workout_merge import (
     best_strength_match,
+    coverage_annotations,
     fields_from_source,
     merge_fields,
     normalize_source,
@@ -1817,7 +1819,12 @@ class Database:
         day = source_rows[0]["day"]
         is_strength = any(is_strength_like(r.get("type")) for r in source_rows)
         sources = {normalize_source(r): r for r in source_rows}
-        merged_cols, provenance = merge_fields(sources, is_strength)
+        # Quality-aware selection: a source that only recorded a slice of the
+        # session cannot supply its duration/calories/load, however high its
+        # usual priority. Its physiology is kept with its coverage recorded.
+        quality = source_quality(sources)
+        merged_cols, provenance = merge_fields(sources, is_strength, quality)
+        field_coverage = coverage_annotations(provenance, quality)
 
         result: dict[str, Any] = {
             "canonical_activity_id": existing_canonical_id,
@@ -1829,6 +1836,8 @@ class Database:
             "field_sources": provenance,
             "match_confidence": confidence,
             "match_reason": reason,
+            "source_quality": quality,
+            "field_coverage": field_coverage,
             "name": merged_cols.get("name"),
             "duration_s": merged_cols.get("duration_s"),
             "avg_hr": merged_cols.get("avg_hr"),
@@ -1858,7 +1867,10 @@ class Database:
             source="merged",
             load_source=merged_cols.get("load_source"),
             field_sources=json.dumps(provenance, ensure_ascii=False),
-            meta_json=json.dumps({"linked": source_ids}),
+            meta_json=json.dumps(
+                {"linked": source_ids, "field_coverage": field_coverage},
+                ensure_ascii=False,
+            ),
         )
         with self.session() as s:
             for r in source_rows:
@@ -2126,10 +2138,22 @@ class Database:
                 field_sources = json.loads(canonical_dump["field_sources"])
             except ValueError:
                 pass
+        field_coverage: dict[str, Any] = {}
+        if canonical_dump.get("meta_json"):
+            try:
+                field_coverage = json.loads(canonical_dump["meta_json"]).get(
+                    "field_coverage", {}
+                ) or {}
+            except ValueError:
+                pass
         return {
             "canonical": canonical_dump,
             "is_merged": canonical_dump.get("source") == "merged",
             "field_sources": field_sources,
+            # Which canonical fields came from a source that only recorded part
+            # of the session — so partial physiology is never read as covering
+            # the whole workout.
+            "field_coverage": field_coverage,
             "linked_sources": linked_sources,
             "strength_sessions": [self.get_strength_session(sid) for sid in session_ids],
             "physiology": {
@@ -2251,6 +2275,26 @@ class Database:
         return out
 
     # ── Backup ─────────────────────────────────────────────────────────────────
+
+    def workout_data_quality(self, days: int = 90) -> dict[str, Any]:
+        """Read-only data-quality report over the last ``days`` of workouts.
+
+        Reads *every* row including duplicates and merge sources — the
+        incomplete-recording check needs both sides of a pair — and returns
+        typed findings. It never writes: detecting a bad merge and fixing one
+        are deliberately separate calls, and the fix goes through
+        ``merge_workout_sources`` (with ``dry_run`` to preview it first).
+        """
+        with self.session() as s:
+            workouts = [
+                r.model_dump() for r in s.exec(
+                    select(Workout)
+                    .where(Workout.day >= self._cutoff(days))
+                    .order_by(Workout.day.desc(), Workout.activity_id.desc())
+                ).all()
+            ]
+            links = [r.model_dump() for r in s.exec(select(WorkoutSourceLink)).all()]
+        return quality_report(workouts, links, days=days)
 
     def backup_to(self, dest: str | Path) -> None:
         """Copy the live database to ``dest`` with SQLite's online backup API
