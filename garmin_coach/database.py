@@ -43,6 +43,8 @@ from .exercise_metrics import (
 )
 from .models import (
     SUMMARY_COLUMNS,
+    ActivityDetail,
+    ActivityLength,
     BodyBattery,
     BodyMeasurement,
     Conversation,
@@ -73,8 +75,10 @@ from .models import (
     WorkoutSourceLink,
 )
 from .training_load import estimate_training_load
+from .workout_quality import quality_report, source_quality
 from .workout_merge import (
     best_strength_match,
+    coverage_annotations,
     fields_from_source,
     merge_fields,
     normalize_source,
@@ -360,6 +364,105 @@ class Database:
                 stmt = stmt.where(Workout.duplicate_of == None)  # noqa: E711
             rows = s.exec(stmt).all()
         return [r.model_dump() for r in rows]
+
+    # ── Activity detail (splits/lengths beyond the daily summary) ──────────────
+    # Garmin's per-day activity list carries summary fields only. Swim analytics
+    # additionally needs the separate elapsed/timer/active clocks and the
+    # per-length records, which come from a second, per-activity call. Both are
+    # stored here so the analytics read stays local and the ingestion stays
+    # idempotent: re-syncing an activity refreshes its detail row and *replaces*
+    # its lengths rather than appending a second copy.
+
+    def upsert_activity_detail(self, activity_id: int, day: str | date, **f: Any) -> None:
+        """Field-preserving upsert of one activity's detail row."""
+        self._upsert(ActivityDetail(activity_id=activity_id, day=_as_day(day), **f))
+
+    def replace_activity_lengths(
+        self, activity_id: int, lengths: list[dict[str, Any]]
+    ) -> int:
+        """Store the recorded lengths for an activity, replacing any existing.
+
+        Replace (not append) is what makes a re-sync idempotent: the provider is
+        the source of truth for how many lengths a session had, and a second
+        ingestion must not double them. Returns the number of rows stored.
+        """
+        with self.session() as s:
+            for row in s.exec(
+                select(ActivityLength).where(ActivityLength.activity_id == activity_id)
+            ).all():
+                s.delete(row)
+            for index, length in enumerate(lengths):
+                data = dict(length)
+                data.setdefault("length_index", index + 1)
+                s.add(ActivityLength(activity_id=activity_id, **data))
+            s.commit()
+        return len(lengths)
+
+    def activity_details(self, activity_ids: list[int]) -> dict[int, dict[str, Any]]:
+        """Detail rows for the given activities, keyed by ``activity_id``."""
+        if not activity_ids:
+            return {}
+        with self.session() as s:
+            rows = s.exec(
+                select(ActivityDetail).where(
+                    ActivityDetail.activity_id.in_(list(activity_ids))
+                )
+            ).all()
+        return {r.activity_id: r.model_dump() for r in rows}
+
+    def activity_lengths(self, activity_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
+        """Recorded lengths per activity, ordered by ``length_index``."""
+        if not activity_ids:
+            return {}
+        with self.session() as s:
+            rows = s.exec(
+                select(ActivityLength)
+                .where(ActivityLength.activity_id.in_(list(activity_ids)))
+                .order_by(ActivityLength.activity_id, ActivityLength.length_index)
+            ).all()
+        out: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            out.setdefault(row.activity_id, []).append(row.model_dump())
+        return out
+
+    def activities_missing_detail(
+        self,
+        types: list[str] | None = None,
+        days: int = 365,
+        limit: int = 25,
+        retry_errors: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Canonical activities in the window that have no detail row yet.
+
+        The bounded, resumable half of the historical backfill: activities we
+        already asked about (whatever the answer) are skipped, so a resumed run
+        makes progress instead of retrying the same unsupported activities.
+        ``retry_errors`` re-queues rows whose previous attempt errored.
+        """
+        with self.session() as s:
+            stmt = (
+                select(Workout)
+                .where(Workout.day >= self._cutoff(days))
+                .where(Workout.duplicate_of == None)  # noqa: E711
+                .order_by(Workout.day.desc(), Workout.activity_id.desc())
+            )
+            rows = [r.model_dump() for r in s.exec(stmt).all()]
+            existing = {
+                r.activity_id: r.status
+                for r in s.exec(select(ActivityDetail)).all()
+            }
+        wanted = {t.lower() for t in (types or [])}
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if wanted and (row.get("type") or "").lower() not in wanted:
+                continue
+            status = existing.get(row["activity_id"])
+            if status is not None and not (retry_errors and status == "error"):
+                continue
+            out.append(row)
+            if len(out) >= max(1, limit):
+                break
+        return out
 
     # ── Meals (user-logged, not pulled from Garmin) ─────────────────────────────
 
@@ -1716,7 +1819,12 @@ class Database:
         day = source_rows[0]["day"]
         is_strength = any(is_strength_like(r.get("type")) for r in source_rows)
         sources = {normalize_source(r): r for r in source_rows}
-        merged_cols, provenance = merge_fields(sources, is_strength)
+        # Quality-aware selection: a source that only recorded a slice of the
+        # session cannot supply its duration/calories/load, however high its
+        # usual priority. Its physiology is kept with its coverage recorded.
+        quality = source_quality(sources)
+        merged_cols, provenance = merge_fields(sources, is_strength, quality)
+        field_coverage = coverage_annotations(provenance, quality)
 
         result: dict[str, Any] = {
             "canonical_activity_id": existing_canonical_id,
@@ -1728,6 +1836,8 @@ class Database:
             "field_sources": provenance,
             "match_confidence": confidence,
             "match_reason": reason,
+            "source_quality": quality,
+            "field_coverage": field_coverage,
             "name": merged_cols.get("name"),
             "duration_s": merged_cols.get("duration_s"),
             "avg_hr": merged_cols.get("avg_hr"),
@@ -1757,7 +1867,10 @@ class Database:
             source="merged",
             load_source=merged_cols.get("load_source"),
             field_sources=json.dumps(provenance, ensure_ascii=False),
-            meta_json=json.dumps({"linked": source_ids}),
+            meta_json=json.dumps(
+                {"linked": source_ids, "field_coverage": field_coverage},
+                ensure_ascii=False,
+            ),
         )
         with self.session() as s:
             for r in source_rows:
@@ -2025,10 +2138,22 @@ class Database:
                 field_sources = json.loads(canonical_dump["field_sources"])
             except ValueError:
                 pass
+        field_coverage: dict[str, Any] = {}
+        if canonical_dump.get("meta_json"):
+            try:
+                field_coverage = json.loads(canonical_dump["meta_json"]).get(
+                    "field_coverage", {}
+                ) or {}
+            except ValueError:
+                pass
         return {
             "canonical": canonical_dump,
             "is_merged": canonical_dump.get("source") == "merged",
             "field_sources": field_sources,
+            # Which canonical fields came from a source that only recorded part
+            # of the session — so partial physiology is never read as covering
+            # the whole workout.
+            "field_coverage": field_coverage,
             "linked_sources": linked_sources,
             "strength_sessions": [self.get_strength_session(sid) for sid in session_ids],
             "physiology": {
@@ -2150,6 +2275,26 @@ class Database:
         return out
 
     # ── Backup ─────────────────────────────────────────────────────────────────
+
+    def workout_data_quality(self, days: int = 90) -> dict[str, Any]:
+        """Read-only data-quality report over the last ``days`` of workouts.
+
+        Reads *every* row including duplicates and merge sources — the
+        incomplete-recording check needs both sides of a pair — and returns
+        typed findings. It never writes: detecting a bad merge and fixing one
+        are deliberately separate calls, and the fix goes through
+        ``merge_workout_sources`` (with ``dry_run`` to preview it first).
+        """
+        with self.session() as s:
+            workouts = [
+                r.model_dump() for r in s.exec(
+                    select(Workout)
+                    .where(Workout.day >= self._cutoff(days))
+                    .order_by(Workout.day.desc(), Workout.activity_id.desc())
+                ).all()
+            ]
+            links = [r.model_dump() for r in s.exec(select(WorkoutSourceLink)).all()]
+        return quality_report(workouts, links, days=days)
 
     def backup_to(self, dest: str | Path) -> None:
         """Copy the live database to ``dest`` with SQLite's online backup API

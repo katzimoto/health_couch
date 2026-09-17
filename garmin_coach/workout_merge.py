@@ -135,21 +135,49 @@ def best_strength_match(
     return garmin, confidence, reason
 
 
+# Domains whose fields describe *the whole session*. A source that only
+# recorded part of the session must not supply these just because its source
+# normally wins: eleven seconds of watch recording is not the session's
+# duration, calorie burn or training load.
+_WHOLE_SESSION_DOMAINS = ("duration", "calories", "training_load")
+
+
 def merge_fields(
-    sources: dict[str, dict[str, Any]], is_strength: bool
-) -> tuple[dict[str, Any], dict[str, str]]:
+    sources: dict[str, dict[str, Any]],
+    is_strength: bool,
+    quality: dict[str, dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
     """Resolve the canonical physical fields from per-source rows.
 
     ``sources`` maps a normalized source name (``manual``/``garmin``/``apple``)
-    to that source's workout row. Returns ``(merged_columns, field_sources)``
-    where ``field_sources`` records, per field, which source won — the
-    provenance the report and ``get_merged_workout`` surface.
+    to that source's workout row. ``quality`` is
+    :func:`~garmin_coach.workout_quality.source_quality` output; when a source
+    is marked incomplete its *whole-session* fields (duration, calories,
+    training load) are demoted below any complete source, whatever the usual
+    domain priority says. Its physiology is still kept — a partial HR recording
+    is real data — but the coverage is recorded so nobody reads it as
+    whole-session physiology.
+
+    Returns ``(merged_columns, field_sources)`` — the same two-value contract it
+    has always had. Per-field coverage annotations come from
+    :func:`coverage_annotations`, so existing callers are unaffected.
     """
     merged: dict[str, Any] = {}
     provenance: dict[str, str] = {}
+    quality = quality or {}
+
+    def complete(src: str) -> bool:
+        entry = quality.get(src)
+        return True if entry is None else bool(entry.get("complete", True))
 
     for domain, columns in _DOMAIN_COLUMNS.items():
-        priority = _DOMAIN_PRIORITY[domain]
+        priority = list(_DOMAIN_PRIORITY[domain])
+        if domain in _WHOLE_SESSION_DOMAINS:
+            # Stable partition: complete sources first, incomplete ones after,
+            # each keeping their relative priority.
+            priority = [s for s in priority if complete(s)] + [
+                s for s in priority if not complete(s)
+            ]
         for column in columns:
             for src in priority:
                 row = sources.get(src)
@@ -190,3 +218,27 @@ def merge_fields(
 def fields_from_source(provenance: dict[str, str], source: str) -> list[str]:
     """Which canonical fields a given source provided (for a link's audit)."""
     return sorted(field for field, src in provenance.items() if src == source)
+
+
+def coverage_annotations(
+    provenance: dict[str, str], quality: dict[str, dict[str, Any]] | None
+) -> dict[str, Any]:
+    """Per-field coverage notes for fields won by an *incomplete* source.
+
+    A partial recording's heart rate is real data about the slice it covers, so
+    it is kept rather than discarded — but the canonical must say so, or a
+    reader would take it for whole-session physiology.
+    """
+    if not quality:
+        return {}
+    out: dict[str, Any] = {}
+    for field, src in provenance.items():
+        entry = quality.get(src)
+        if entry and not entry.get("complete", True):
+            out[field] = {
+                "source": src,
+                "coverage_ratio": entry.get("coverage_ratio"),
+                "covers": "partial",
+                "reason": entry.get("reason"),
+            }
+    return out
