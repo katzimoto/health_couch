@@ -208,3 +208,85 @@ not pool across pools.
 * Sessions recorded before detail ingestion existed report elapsed time only
   until `backfill_swim_details` has run over them; they are listed under
   `data_quality.sessions_without_detail_ingested`.
+
+## `get_strength_progress(exercise=None, days=120, include_sessions=True)`
+
+Longitudinal strength progression — `garmin_coach/strength_progress.py`, built
+on the existing strength tables and `exercise_metrics.normalize_performance`
+(so a legacy `"3"`, a rep range `"10-12"` or a JSON list degrades to `None` with
+a data-quality note instead of crashing or being guessed at).
+
+With `exercise` set it returns the per-session history, records, progression and
+data-quality report for one lift. Without it, a bounded per-exercise summary of
+everything trained in the window.
+
+### Volume
+
+| Case | `volume_basis` | Formula |
+| --- | --- | --- |
+| Per-set data recorded | `per_set` | `Σ(reps × weight)` over the recorded sets — **exact**, so 10×60 + 8×70 + 6×80 = 1640 kg, not 80 × 24. |
+| Aggregate columns only | `aggregate_estimate` | Carried from `exercise_history` and labelled; sets at different weights are not distinguishable in such a record. |
+| Skipped / substituted | `null` | Excluded from completed volume entirely. |
+
+A set whose reps or weight cannot be read is not counted as completed work.
+
+### Top set vs working weight
+
+`top_set_weight_kg` is the heaviest set; `working_weight_kg` is the weight
+carried across **every** working set; `all_sets_at_top_weight` distinguishes the
+two. A weight record reports its `scope` accordingly — *"carried across every
+working set"* vs *"top set only"* — so adding a heavier single is never
+presented as moving the whole session up.
+
+### Records
+
+Observed over the user's own logged sessions only:
+`heaviest_weight_kg`, `highest_volume_kg`, `most_reps_in_a_set` (with the note
+that more reps at a lighter weight is not a heavier lift) and
+`best_estimated_1rm`. Sessions that were skipped, substituted or whose stored
+values couldn't be read are listed under `excluded_sessions` — reported, not
+silently dropped.
+
+### Estimated 1RM
+
+Epley, `weight × (1 + reps / 30)`, produced **only** from a completed set of
+1–10 reps and always flagged `is_estimate: true` with the formula named. Outside
+that range the value is `null` with a reason. It is not a measured maximum.
+
+### Aliases, equipment and load conventions
+
+Normalization folds case, spacing, punctuation and a short list of unambiguous
+abbreviations (`DB` → dumbbell, `OHP` → overhead press, `pull-ups` → pullup).
+Plural folding is deliberately timid (`press` and `lats` keep their ending).
+Nothing that changes the movement or the equipment folds: *incline dumbbell
+press* ≠ *dumbbell press*, and the same movement on two machines is two
+progressions (`equipment_variants` + an explicit note).
+
+`load_convention` names how the number should be read:
+
+| Convention | Meaning |
+| --- | --- |
+| `per_hand` | Dumbbell/kettlebell — not comparable with a barbell total. |
+| `total_load` | Total external load including the bar. |
+| `machine_stack` | Specific to that machine's leverage; never comparable with free weights or a different machine. |
+| `bodyweight` | Any recorded weight is *added* load. |
+| `assisted` | A larger number means an *easier* set. |
+| `unknown` | The log doesn't say — reported as recorded, never assumed. |
+
+### Progression
+
+Change from the earliest to the latest usable session in the window (absolute,
+percentage, with dates). `percent_change` is withheld on a zero or missing
+baseline. A `rate` (least-squares slope of top-set weight per week) needs at
+least `MIN_SESSIONS_FOR_RATE` (3) usable sessions; below that it is `null` with
+a reason rather than noise. Fewer than two sessions → no progression claimed at
+all.
+
+### Limitations
+
+* Records are the user's own observed bests in the window — not population
+  rankings, not forecasts.
+* A volume change that mixes exact per-set sessions with aggregate estimates is
+  flagged `mixed_basis` with a caveat.
+* Existing `get_exercise_history` and `recommend_next_weights` are untouched and
+  remain the write/recommendation path.
