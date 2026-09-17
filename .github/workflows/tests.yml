@@ -18,7 +18,10 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # Match the runtime image (Dockerfile: python:3.12-slim). The pinned
+          # garminconnect requires >= 3.12, so an older runner cannot install
+          # the project's own requirements.
+          python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
