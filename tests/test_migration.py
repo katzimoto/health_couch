@@ -102,7 +102,13 @@ def test_legacy_db_accepts_meals_after_migration(legacy_path: str) -> None:
 def test_mcp_log_meal_hummus_end_to_end(tmp_path, monkeypatch) -> None:
     """The failing production call, through the actual MCP tool functions."""
     import importlib
+    import os
 
+    # Restore to conftest's throwaway path, never to the unset default: the
+    # reloads below re-run every module-level `Database()`, and with DB_PATH
+    # absent that would try to create the production directory (/app/data) —
+    # which fails outright as a non-root user, e.g. on CI.
+    original_db_path = os.environ["DB_PATH"]
     monkeypatch.setenv("DB_PATH", str(tmp_path / "legacy_mcp.db"))
     _make_legacy_db(str(tmp_path / "legacy_mcp.db"))
     # Reload config + every module holding settings/db at import time (same
@@ -136,7 +142,7 @@ def test_mcp_log_meal_hummus_end_to_end(tmp_path, monkeypatch) -> None:
         assert hummus[0]["protein_g"] is None  # macros stay optional
     finally:
         # Restore module state for tests that import these afterwards.
-        monkeypatch.delenv("DB_PATH", raising=False)
+        monkeypatch.setenv("DB_PATH", original_db_path)
         importlib.reload(config)
         importlib.reload(database)
         importlib.reload(analysis)
