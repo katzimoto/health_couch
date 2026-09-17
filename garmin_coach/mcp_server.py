@@ -261,6 +261,32 @@ def get_strength_progress(
 
 
 @mcp.tool
+def get_workout_data_quality(days: int = 90) -> dict:
+    """Read-only data-quality report over recorded workouts.
+
+    Typed findings with severity, the activity (and any related source), the
+    evidence behind the finding and a suggested action:
+
+    * ``near_zero_duration`` — a recording far too short to be a whole session;
+    * ``partial_recording`` — a device recording covering only part of a session
+      another source recorded in full, so its heart rate, calories and load
+      describe a slice, not the session;
+    * ``zero_distance`` / ``impossible_speed`` / ``impossible_time_distance`` —
+      physically inconsistent distance and time;
+    * ``missing_essential_data`` — neither duration nor distance recorded;
+    * ``source_field_mismatch`` — two sources of one session disagree;
+    * ``unresolved_match_candidate`` — two records that *may* be one session but
+      lack sufficient timing/duration evidence; they are left separate, never
+      merged on a shared date alone.
+
+    Nothing is modified by this call. To act on a finding, preview with
+    ``merge_workout_sources(..., dry_run=True)`` and then apply it explicitly;
+    ``unmerge_workout_sources`` reverses a bad match. ``records_blocked_activity_ids``
+    lists the sessions the progression reports keep out of records and totals."""
+    return db.workout_data_quality(days=max(1, min(days, 3650)))
+
+
+@mcp.tool
 def get_recorded_activity_types(days: int = 90) -> list[dict]:
     """Every activity type actually recorded in the last ``days``, with its
     canonical key, family, session count and the raw type strings seen — so a
