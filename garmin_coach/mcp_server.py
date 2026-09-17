@@ -47,6 +47,7 @@ from .nutrition_gaps import (
 )
 from .progression import recommend_next_weight, recovery_caution
 from .reminders import DEFAULT_TIMEZONE, Reminders
+from .swimming import build_swimming_progress
 from .telegram_sender import send_telegram_message
 from .training_load import estimate_training_load
 from .workout_flow import WorkoutLogFlows
@@ -163,6 +164,61 @@ def get_activity_progress(
         days=days,
         baseline_days=baseline_days,
         include_sessions=include_sessions,
+    )
+
+
+@mcp.tool
+def get_swimming_progress(
+    days: int = 90,
+    pool_length_m: float | None = None,
+    stroke: str | None = None,
+    min_distance_m: float | None = None,
+    include_sessions: bool = False,
+) -> dict:
+    """Swimming progression over ``days`` — the call that distinguishes faster
+    swimming from shorter rests, greater effort and better stroke efficiency.
+
+    Reports **active pace and elapsed pace as separate series** (with their own
+    sample counts), rest time and its derivation, sessions/week, weekly distance
+    and duration, stroke-efficiency metrics grouped by pool length *and* stroke
+    (never pooled across them), the longest session, and best continuous
+    50/100/200/400 m efforts computed only from contiguous recorded lengths —
+    never interpolated from a whole-session average and never bridged across a
+    rest or a recording gap.
+
+    A session recorded with elapsed time only is labelled as such and gets no
+    invented active pace, SWOLF, efficiency or continuous PR. Pool and
+    open-water swims are reported separately under ``by_modality``. Optional
+    filters narrow to a comparable set and report what they excluded.
+
+    Sessions recorded before swim-detail ingestion existed appear under
+    ``data_quality.sessions_without_detail_ingested``; run
+    ``backfill_swim_details`` to fill them in.
+    """
+    return build_swimming_progress(
+        db,
+        days=days,
+        pool_length_m=pool_length_m,
+        stroke=stroke,
+        min_distance_m=min_distance_m,
+        include_sessions=include_sessions,
+    )
+
+
+@mcp.tool
+def backfill_swim_details(days: int = 365, limit: int = 25, retry_errors: bool = False) -> dict:
+    """Ingest per-length/split detail for swims recorded before detail
+    ingestion existed (or that previously failed).
+
+    Bounded and resumable: at most ``limit`` activities per call, skipping any
+    already asked about, so a long history fills in gradually without
+    re-triggering Garmin's rate limiting. Repeated runs are idempotent —
+    detail is refreshed and lengths are replaced, never duplicated.
+    ``remaining`` in the response says how much is left to do."""
+    return _garmin_client().pull_activity_details(
+        days=max(1, min(days, 3650)),
+        limit=max(1, min(limit, 200)),
+        retry_errors=retry_errors,
     )
 
 

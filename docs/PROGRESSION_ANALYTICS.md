@@ -134,3 +134,77 @@ Every activity type actually recorded in the window with its canonical key,
 family, session count and the raw type strings seen. The combined progress
 report iterates this so a sport the user does (a swim, a row) can never be
 silently omitted because nobody asked for it by name.
+
+## `get_swimming_progress(days=90, pool_length_m=None, stroke=None, min_distance_m=None, include_sessions=False)`
+
+First-class swim analytics — `garmin_coach/swimming.py`, backed by the swim
+detail ingested into `activity_detail` / `activity_length`.
+
+A swim summary alone cannot say whether the swimmer got faster: an
+equal-distance session can be quicker because the swimming was faster, because
+the rests were shorter, or because the effort was higher. The report keeps those
+apart.
+
+### Ingestion
+
+Garmin's per-day activity list is summaries only (one duration, no lengths, no
+rest). `GarminClient._pull_activity_detail` makes a second, per-activity call for
+swim types and stores:
+
+* `activity_detail` — one row per activity asked about, with the **separate**
+  `elapsed_duration_s`, `timer_duration_s` and `active_duration_s` clocks,
+  `rest_duration_s` + `rest_source`, pool length (raw value, unit, and metres
+  only when the unit is known), primary stroke and provider session averages.
+  `status` is `ok` / `empty` / `unsupported` / `error`.
+* `activity_length` — one row per recorded length/lap, with `is_rest` marked.
+
+Properties this buys:
+
+| Property | How |
+| --- | --- |
+| Daily ingestion never breaks | The detail call is wrapped per activity; a failure logs and records `status="error"`, the summary write already happened. |
+| Backfill is bounded and resumable | `backfill_swim_details(days, limit, retry_errors)` asks about at most `limit` activities and skips any already asked about, whatever the answer. `remaining` reports what's left. |
+| Re-sync is idempotent | The detail row is a field-preserving upsert; lengths are **replaced**, never appended. |
+| Unsupported providers degrade | Capability detection (`get_activity`, `get_activity_typed_splits` / `get_activity_splits`); a client exposing neither records `status="unsupported"` once and is not re-asked. |
+
+### Time semantics
+
+Elapsed, timer and active time are **not interchangeable**. Rest is only
+produced from a documented compatible pair:
+
+1. the sum of provider-marked rest intervals, or
+2. `elapsed_duration − active_duration` when both exist.
+
+Otherwise `rest_duration_s` is `null` with a reason, and
+`active_time_available: false` means no active pace, SWOLF, stroke efficiency or
+continuous PR is reported for that session.
+
+### Continuous-effort bests
+
+`best_continuous_effort` slides a window over each **contiguous run** of
+adjacent, non-rest lengths in one stroke (a rest, a stroke change or a gap in
+`length_index` ends a run) and only accepts a window whose summed length
+distance equals the target *exactly*. So:
+
+* a 25 m pool supports 50/100/200/400 m; a 33 m pool does **not** support 100 m;
+* two 50 m blocks either side of a rest never become a 100 m PR;
+* a session with no length data supports **no** continuous bests, and says so.
+
+### Comparability
+
+Efficiency is grouped by pool length *as recorded* (value **and** unit) plus
+stroke — a 25 yd session and a 25 m session are never pooled, and neither are
+different strokes. Pool and open-water swims are reported separately under
+`by_modality`. Distance totals convert yards to metres; efficiency metrics do
+not pool across pools.
+
+### Limitations
+
+* SWOLF and strokes-per-length are only comparable within one pool length and
+  stroke; the response repeats that caveat next to the value.
+* A faster active pace at a higher average heart rate is a harder effort, not
+  proof of improved fitness — `comparison.interpretation_note` says so and the
+  HR comparison sits beside the pace comparison.
+* Sessions recorded before detail ingestion existed report elapsed time only
+  until `backfill_swim_details` has run over them; they are listed under
+  `data_quality.sessions_without_detail_ingested`.

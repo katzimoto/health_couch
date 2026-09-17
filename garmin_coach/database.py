@@ -43,6 +43,8 @@ from .exercise_metrics import (
 )
 from .models import (
     SUMMARY_COLUMNS,
+    ActivityDetail,
+    ActivityLength,
     BodyBattery,
     BodyMeasurement,
     Conversation,
@@ -360,6 +362,105 @@ class Database:
                 stmt = stmt.where(Workout.duplicate_of == None)  # noqa: E711
             rows = s.exec(stmt).all()
         return [r.model_dump() for r in rows]
+
+    # ── Activity detail (splits/lengths beyond the daily summary) ──────────────
+    # Garmin's per-day activity list carries summary fields only. Swim analytics
+    # additionally needs the separate elapsed/timer/active clocks and the
+    # per-length records, which come from a second, per-activity call. Both are
+    # stored here so the analytics read stays local and the ingestion stays
+    # idempotent: re-syncing an activity refreshes its detail row and *replaces*
+    # its lengths rather than appending a second copy.
+
+    def upsert_activity_detail(self, activity_id: int, day: str | date, **f: Any) -> None:
+        """Field-preserving upsert of one activity's detail row."""
+        self._upsert(ActivityDetail(activity_id=activity_id, day=_as_day(day), **f))
+
+    def replace_activity_lengths(
+        self, activity_id: int, lengths: list[dict[str, Any]]
+    ) -> int:
+        """Store the recorded lengths for an activity, replacing any existing.
+
+        Replace (not append) is what makes a re-sync idempotent: the provider is
+        the source of truth for how many lengths a session had, and a second
+        ingestion must not double them. Returns the number of rows stored.
+        """
+        with self.session() as s:
+            for row in s.exec(
+                select(ActivityLength).where(ActivityLength.activity_id == activity_id)
+            ).all():
+                s.delete(row)
+            for index, length in enumerate(lengths):
+                data = dict(length)
+                data.setdefault("length_index", index + 1)
+                s.add(ActivityLength(activity_id=activity_id, **data))
+            s.commit()
+        return len(lengths)
+
+    def activity_details(self, activity_ids: list[int]) -> dict[int, dict[str, Any]]:
+        """Detail rows for the given activities, keyed by ``activity_id``."""
+        if not activity_ids:
+            return {}
+        with self.session() as s:
+            rows = s.exec(
+                select(ActivityDetail).where(
+                    ActivityDetail.activity_id.in_(list(activity_ids))
+                )
+            ).all()
+        return {r.activity_id: r.model_dump() for r in rows}
+
+    def activity_lengths(self, activity_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
+        """Recorded lengths per activity, ordered by ``length_index``."""
+        if not activity_ids:
+            return {}
+        with self.session() as s:
+            rows = s.exec(
+                select(ActivityLength)
+                .where(ActivityLength.activity_id.in_(list(activity_ids)))
+                .order_by(ActivityLength.activity_id, ActivityLength.length_index)
+            ).all()
+        out: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            out.setdefault(row.activity_id, []).append(row.model_dump())
+        return out
+
+    def activities_missing_detail(
+        self,
+        types: list[str] | None = None,
+        days: int = 365,
+        limit: int = 25,
+        retry_errors: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Canonical activities in the window that have no detail row yet.
+
+        The bounded, resumable half of the historical backfill: activities we
+        already asked about (whatever the answer) are skipped, so a resumed run
+        makes progress instead of retrying the same unsupported activities.
+        ``retry_errors`` re-queues rows whose previous attempt errored.
+        """
+        with self.session() as s:
+            stmt = (
+                select(Workout)
+                .where(Workout.day >= self._cutoff(days))
+                .where(Workout.duplicate_of == None)  # noqa: E711
+                .order_by(Workout.day.desc(), Workout.activity_id.desc())
+            )
+            rows = [r.model_dump() for r in s.exec(stmt).all()]
+            existing = {
+                r.activity_id: r.status
+                for r in s.exec(select(ActivityDetail)).all()
+            }
+        wanted = {t.lower() for t in (types or [])}
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if wanted and (row.get("type") or "").lower() not in wanted:
+                continue
+            status = existing.get(row["activity_id"])
+            if status is not None and not (retry_errors and status == "error"):
+                continue
+            out.append(row)
+            if len(out) >= max(1, limit):
+                break
+        return out
 
     # ── Meals (user-logged, not pulled from Garmin) ─────────────────────────────
 

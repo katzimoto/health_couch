@@ -755,6 +755,13 @@ def build_activity_progress(
         w for w in typed if base_start_iso <= (w.get("day") or "") <= base_end_iso
     ]
 
+    # Sports with ingested detail (swims) carry a separately recorded active
+    # clock; attaching it here is what makes ``time_basis`` say
+    # ``active_duration`` and keeps this view's pace identical to the
+    # specialist service's, rather than quietly using elapsed time.
+    if profile["family"] == "swim":
+        _attach_active_duration(db, current_rows + baseline_rows)
+
     # Data-quality exclusions reuse the existing detector rather than adding a
     # competing pipeline; a flagged row still counts as a session.
     warnings = detect_workout_quality_warnings(current_rows)
@@ -848,6 +855,26 @@ def build_activity_progress(
         ]
         result["sessions_truncated"] = len(current_rows) > session_limit
     return result
+
+
+def _attach_active_duration(db, rows: list[dict[str, Any]]) -> None:
+    """Fill ``active_duration_s`` on rows that have ingested activity detail.
+
+    Mutates in place; rows with no detail row (or no active clock recorded)
+    are left untouched, so a session with only elapsed time keeps reporting
+    elapsed time rather than acquiring an invented moving time.
+    """
+    ids = [r["activity_id"] for r in rows if r.get("activity_id") is not None]
+    if not ids:
+        return
+    try:
+        details = db.activity_details(ids)
+    except Exception:  # noqa: BLE001 — detail is an enrichment, never required
+        return
+    for row in rows:
+        detail = details.get(row.get("activity_id"))
+        if detail and detail.get("active_duration_s") is not None:
+            row["active_duration_s"] = detail["active_duration_s"]
 
 
 def _now_iso(timezone_name: str | None) -> str:
