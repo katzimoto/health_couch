@@ -427,3 +427,64 @@ visible when the device recorded no HR and no load at all**.
   estimator already documents its inputs, and inventing an RPE or deriving a
   full-session load from a truncated recording is exactly what the quality
   detector exists to prevent.
+
+## `get_training_progress_report(days=56, baseline_days=None, detail=False)`
+
+The default answer source for *"how am I progressing?"* —
+`garmin_coach/progress_report.py`. Composed from the deterministic services
+above, not from an LLM re-deriving numbers from raw logs.
+
+### Sections
+
+| Section | Contents |
+| --- | --- |
+| `sports` | One section per activity type **actually recorded** in the window (so swimming or another major sport can never be silently omitted), each with summary, baseline summary, comparison and observed records. |
+| `swimming` | The full swimming report when any swim exists, else `available: false` with a reason. |
+| `strength` | Per-exercise records, progression and load conventions. |
+| `adherence` | `TrainingPlan` statuses with an explicit denominator. |
+| `recovery` | Reused from `Analyzer.report` plus the latest readiness check-in. |
+| `notable_prs` | Each labelled `observation` or `estimate`, with `basis` and source ids. |
+| `concerns` | Declines, effort-confounded improvements, thin samples, incomplete recordings, unresolved reconciliation, sparse coverage. |
+| `data_quality` | The quality roll-up plus the ids excluded from totals and records. |
+
+### Consistency by construction
+
+The `sports` sections are built from one `recent_workouts` scan through the
+**same** `activity_progress` primitives (`summarize_sessions`, `compare`,
+`observed_records`) that `get_activity_progress` uses. A test asserts the
+report's running section equals the per-sport endpoint's numbers — count,
+distance, pace and records — for the same window. `detail=True` adds the full
+per-sport reports, the per-exercise strength history and the sport load
+breakdown.
+
+### Adherence
+
+```
+completion_rate_pct = (completed + 0.5 × partially_completed) ÷ resolved × 100
+```
+
+`resolved` = done + partially_done + skipped. Plans still marked `planned` are
+excluded from the rate and reported as `still_open`. **No recorded plan means
+adherence is `available: false` with a reason — never 0%.**
+
+### What it will not say
+
+* No population rankings and no forecasts — the comparison is the user's own
+  preceding window of equal length, with its selection method stated.
+* No blended *"overall fitness +X%"*: unrelated lifts and sports are never
+  collapsed into one number.
+* Recovery is context, not a cause: the report never claims a recovery metric
+  explains a performance change.
+* A faster pace at a higher heart rate is reported as an observation **and**
+  raised as a concern (`effort_confounded_improvement`), not as proof of
+  improved fitness.
+
+### Reuse in coaching
+
+`progress_report_summary()` is the bounded form. `build_coaching_context(...,
+include_progress_summary=True)` — and `get_today_coaching_context(
+include_progress_summary=True)` — attach it under `progress_summary`, so the
+coach cites these deterministic numbers instead of re-deriving trends. It is off
+by default so the 07:30 plan job stays cheap, and it is failure-isolated: a
+problem building it records an error in that key rather than costing the daily
+plan its context.
