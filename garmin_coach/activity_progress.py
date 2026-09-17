@@ -488,16 +488,27 @@ def _longest(sessions: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
-def observed_records(sessions: list[dict[str, Any]], activity_type: str | None) -> dict[str, Any]:
+def observed_records(
+    sessions: list[dict[str, Any]],
+    activity_type: str | None,
+    excluded_activity_ids: Iterable[int] = (),
+) -> dict[str, Any]:
     """Session-level *observed* records — explicitly not continuous-effort PRs.
 
     The fastest whole session at or above the comparability threshold is an
     observation about that session, not a proof that the same pace could be
     held for a standard race distance. Continuous PRs need contiguous
     length/split data, which the swimming service computes where it exists.
+
+    Sessions in ``excluded_activity_ids`` — an unusable or physically
+    impossible recording — can never create a record; the exclusion is
+    reported rather than silently applied.
     """
     profile = metric_profile(activity_type)
     pace_unit = profile.get("pace")
+    excluded = set(excluded_activity_ids)
+    all_sessions = sessions
+    sessions = [s for s in sessions if s.get("activity_id") not in excluded]
     out: dict[str, Any] = {
         "basis": "whole-session averages over canonical workouts",
         "caveat": (
@@ -508,9 +519,22 @@ def observed_records(sessions: list[dict[str, Any]], activity_type: str | None) 
         "longest_duration_s": None,
         "best_session_pace": None,
     }
+    out["excluded_activity_ids"] = sorted(
+        excluded & {
+            s.get("activity_id") for s in all_sessions if s.get("activity_id") is not None
+        }
+    )
+    if out["excluded_activity_ids"]:
+        out["exclusion_reason"] = (
+            "these recordings are incomplete or physically inconsistent, so they "
+            "cannot support a record (see data_quality.findings)"
+        )
     if not sessions:
         out["available"] = False
-        out["unavailable_reason"] = "no sessions of this type in the window"
+        out["unavailable_reason"] = (
+            "no usable sessions of this type in the window"
+            if all_sessions else "no sessions of this type in the window"
+        )
         return out
     out["available"] = True
 
@@ -733,7 +757,11 @@ def build_activity_progress(
     counts once.
     """
     from .config import settings
-    from .coaching_context import detect_workout_quality_warnings
+    from .workout_quality import (
+        detect_findings,
+        findings_to_warnings,
+        record_blocking_ids,
+    )
 
     tz = timezone_name or settings.timezone
     days = max(1, min(int(days), MAX_WINDOW_DAYS))
@@ -764,11 +792,9 @@ def build_activity_progress(
 
     # Data-quality exclusions reuse the existing detector rather than adding a
     # competing pipeline; a flagged row still counts as a session.
-    warnings = detect_workout_quality_warnings(current_rows)
-    excluded = {
-        w["activity_id"] for w in warnings
-        if w.get("action") == "excluded_from_pace_calcs" and w.get("activity_id")
-    }
+    findings = detect_findings(current_rows)
+    warnings = findings_to_warnings(findings)
+    excluded = record_blocking_ids(findings)
 
     current = summarize_sessions(
         current_rows, canonical, window_days=days, excluded_activity_ids=excluded
@@ -805,14 +831,17 @@ def build_activity_progress(
         "comparison": compare(current, baseline, canonical),
         "weekly_series": series,
         "trends": weekly_trends(series),
-        "records": observed_records(current_rows, canonical),
+        "records": observed_records(current_rows, canonical, excluded),
         "coverage": coverage_report(db, start_iso, end_iso),
         "data_quality": {
             "warnings": warnings,
+            "findings": findings,
             "excluded_from_distance_and_pace": sorted(excluded),
             "note": (
-                "flagged sessions still count towards frequency and volume in "
-                "time terms; they are only excluded from distance/pace maths"
+                "sessions whose recording is unusable (no duration and no "
+                "distance, a physically impossible speed, a near-zero or partial "
+                "recording) are kept out of totals, pace and records, and listed "
+                "here rather than silently dropped"
             ),
         },
         "sessions_included": len(current_rows),
