@@ -31,6 +31,7 @@ from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.auth.providers.workos import AuthKitProvider
 
+from .activity_progress import build_activity_progress, recorded_activity_types
 from .analysis import Analyzer
 from .coaching_context import build_coaching_context
 from .config import settings
@@ -121,6 +122,56 @@ def get_training_load(days: int = 28) -> dict:
         "recent_workouts": db.recent_workouts(days=days),
         "merged_workouts": db.merged_workout_summaries(days=days),
     }
+
+
+# ── Progression analytics ───────────────────────────────────────────────────────
+
+@mcp.tool
+def get_activity_progress(
+    type: str,
+    days: int = 90,
+    baseline_days: int | None = None,
+    include_sessions: bool = False,
+) -> dict:
+    """Progression for one sport over ``days`` — the generic per-activity view.
+
+    ``type`` is an activity type key as recorded by Garmin (``"running"``,
+    ``"lap_swimming"``, ``"cycling"``, ``"walking"``, ``"rowing"``,
+    ``"strength_training"``, …); common spellings are normalised. Materially
+    different modalities stay separate: pool vs open-water swimming, indoor vs
+    outdoor cycling and treadmill vs road running are never pooled, and
+    ``related_types_not_included`` names the siblings you can ask for
+    separately.
+
+    Returns the explicit analysis and baseline windows (calendar days in your
+    timezone), workout count and sessions/week, weekly distance/duration/load,
+    average session duration and distance, weighted pace or speed (derived from
+    total distance ÷ total time, never an average of per-session paces),
+    heart-rate context with its coverage, the longest session, observed
+    session-level records, absolute and percentage changes vs the preceding
+    equal-length baseline, per-calendar-week series with partial weeks marked,
+    least-squares weekly trends, sync coverage, and data-quality exclusions.
+
+    Metrics that do not apply to a sport come back null with an explicit
+    reason — never a fabricated value. Strength and swimming additionally name
+    the specialist tool (``get_strength_progress`` / ``get_swimming_progress``)
+    that models their exercise- or length-level detail.
+    """
+    return build_activity_progress(
+        db,
+        type,
+        days=days,
+        baseline_days=baseline_days,
+        include_sessions=include_sessions,
+    )
+
+
+@mcp.tool
+def get_recorded_activity_types(days: int = 90) -> list[dict]:
+    """Every activity type actually recorded in the last ``days``, with its
+    canonical key, family, session count and the raw type strings seen — so a
+    sport the user does can be discovered rather than guessed at."""
+    return recorded_activity_types(db, days=days)
 
 
 @mcp.tool
