@@ -488,3 +488,75 @@ coach cites these deterministic numbers instead of re-deriving trends. It is off
 by default so the 07:30 plan job stays cheap, and it is failure-isolated: a
 problem building it records an error in that key rather than costing the daily
 plan its context.
+
+## Structured workout metrics (`get_workout_metrics`, `upsert_workout_metrics`, `set_workout_metric_source`)
+
+Multi-source measurements — `garmin_coach/workout_metrics.py` plus the
+`workout_metric` table.
+
+One workout is often measured by two devices at once: the watch has the
+wearer's heart rate and Garmin's training load, the gym machine has distance,
+power, cadence, METs and its own calorie figure, and they never talk to each
+other. Observations are therefore stored **per metric, per source**, with
+exactly one selected as canonical.
+
+### Representation
+
+| Column | Meaning |
+| --- | --- |
+| `metric` / `aggregation` | The identity — `power` + `avg`, `heart_rate` + `max`. |
+| `value` / `unit` | Recorded as stated; units are never silently converted. |
+| `source` / `source_bucket` | The device (`star_trac`) and its kind (`equipment`). |
+| `source_activity_id` / `source_ref` | The row and external reference it was measured on. |
+| `confidence` / `meta_json` | Optional. |
+| `is_selected` | The canonical value for this metric. |
+| `is_override` | The user pinned this source explicitly. |
+
+Metric names normalise (`watts` → power, `rpm` → cadence, an `avg_`/`max_`
+prefix becomes the aggregation) and **unknown names are accepted** with the
+caller's unit — the representation is deliberately extensible.
+
+### Selection rules
+
+Per metric, which *kind* of device to believe (tune `DEFAULT_SOURCE_RULES`, not
+call sites):
+
+| Metric | Priority |
+| --- | --- |
+| `heart_rate`, `respiration_rate` | garmin → apple → equipment → manual |
+| `power`, `cadence`, `mets`, `speed`, `resistance`, `incline` | equipment → garmin → apple → photo → manual |
+| `training_load` | garmin → manual → apple → equipment |
+| anything else | `DEFAULT_PRIORITY`: equipment → garmin → apple → photo → manual |
+
+A manual override (`set_workout_metric_source`) beats all of it. Ties inside one
+bucket break on confidence then source name, so selection is deterministic
+rather than insertion-ordered.
+
+**Losing observations are kept**, in the payload as `alternatives`. Two sources
+differing by more than `CONFLICT_TOLERANCE` (2%) are reported as a `conflict`
+rather than quietly resolved.
+
+### Canonical summary fields
+
+The summary columns still go through `workout_merge` — one merge system, per
+#9, not two. The `equipment` bucket was added there and `distance_m` split into
+its own domain, so a machine-measured distance and a watch-measured heart rate
+can belong to the same canonical workout:
+
+| Domain | Priority |
+| --- | --- |
+| `duration`, `distance`, `calories` | equipment → garmin → apple → manual |
+| `physiology` (avg/max HR, start time) | garmin → apple → manual → equipment |
+| `training_load` | garmin → manual → apple → equipment |
+
+Quality-awareness from #9 still applies on top: a demonstrably partial
+recording cannot supply whole-session fields whatever its bucket.
+
+### Counted once
+
+Metrics attach to the **canonical** workout; each observation keeps the source
+row it was measured on. Re-importing a source's reading of a metric updates that
+row (`observation_identity` is the key), a repeated merge does not duplicate
+observations, and `unmerge_workout_sources` returns them to their source rows.
+The workout itself still counts once in summaries and training load.
+
