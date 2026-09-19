@@ -72,9 +72,19 @@ from .models import (
     Weight,
     Workout,
     WorkoutLogFlow,
+    WorkoutMetric,
     WorkoutSourceLink,
 )
 from .training_load import estimate_training_load
+from .workout_metrics import (
+    metric_key as _metric_key,
+    normalize_metric,
+    normalize_observations,
+    normalize_source as _normalize_metric_source,
+    observation_identity,
+    select_metrics,
+    source_bucket,
+)
 from .workout_quality import quality_report, source_quality
 from .workout_merge import (
     best_strength_match,
@@ -1910,8 +1920,14 @@ class Database:
                     s.add(sess)
             s.commit()
 
+        # Structured metrics follow the session: observations recorded against a
+        # source row now hang off the canonical, each still naming the row it
+        # was measured on.
+        self._repoint_workout_metrics(source_ids, canonical_id)
+
         result["merged"] = True
         result["canonical_activity_id"] = canonical_id
+        result["metrics"] = self.get_workout_metrics(canonical_id)
         return result
 
     def _refresh_canonical(self, canonical_id: int) -> None:
@@ -2154,6 +2170,9 @@ class Database:
             # of the session — so partial physiology is never read as covering
             # the whole workout.
             "field_coverage": field_coverage,
+            # Structured per-metric observations (power, cadence, METs, …) with
+            # the selected value and every alternative still attached.
+            "metrics": self.get_workout_metrics(activity_id),
             "linked_sources": linked_sources,
             "strength_sessions": [self.get_strength_session(sid) for sid in session_ids],
             "physiology": {
@@ -2175,6 +2194,11 @@ class Database:
                     "unmerged": False,
                     "error": f"{canonical_activity_id} is not a merged canonical workout",
                 }
+        # Send every observation back to the row it was recorded against before
+        # the canonical disappears — a bad match must not cost real measurements.
+        self._restore_workout_metrics(canonical_activity_id)
+        with self.session() as s:
+            canonical = s.get(Workout, canonical_activity_id)
             links = s.exec(
                 select(WorkoutSourceLink).where(
                     WorkoutSourceLink.canonical_activity_id == canonical_activity_id
@@ -2295,6 +2319,284 @@ class Database:
             ]
             links = [r.model_dump() for r in s.exec(select(WorkoutSourceLink)).all()]
         return quality_report(workouts, links, days=days)
+
+    # ── Structured multi-source workout metrics ────────────────────────────────
+    # A workout measured by two devices keeps *both* readings: the watch's heart
+    # rate and the machine's power are different measurements of one session,
+    # and even two readings of the *same* metric are kept so a disagreement
+    # stays inspectable. Exactly one observation per metric is ``is_selected``,
+    # chosen by the documented rules in :mod:`workout_metrics` (or by the user's
+    # explicit override). Re-importing a source's reading updates its row rather
+    # than adding another, so metrics cannot be double-counted.
+
+    def upsert_workout_metrics(
+        self,
+        activity_id: int,
+        metrics: Any,
+        source: str | None = None,
+        source_activity_id: int | None = None,
+        source_ref: str | None = None,
+        confidence: float | None = None,
+    ) -> dict[str, Any]:
+        """Record observations against a workout and re-resolve the selection.
+
+        ``metrics`` is a list of observation dicts or a flat mapping
+        (``{"avg_power": 82, "avg_cadence": 54}``). Unusable entries are
+        reported under ``rejected`` rather than silently dropped. Metrics are
+        stored against the *canonical* workout when the given row has already
+        been merged into one, while each observation keeps the source row it
+        came from.
+        """
+        canonical_id = self.canonical_activity_id(activity_id)
+        observations, rejected = normalize_observations(
+            metrics,
+            default_source=source,
+            default_source_activity_id=(
+                source_activity_id if source_activity_id is not None else activity_id
+            ),
+        )
+        stored: list[dict[str, Any]] = []
+        with self.session() as s:
+            existing = s.exec(
+                select(WorkoutMetric).where(WorkoutMetric.activity_id == canonical_id)
+            ).all()
+            by_identity = {
+                observation_identity({
+                    "metric": row.metric,
+                    "aggregation": row.aggregation,
+                    "source": row.source,
+                    "source_activity_id": row.source_activity_id,
+                }): row
+                for row in existing
+            }
+            for observation in observations:
+                row = by_identity.get(observation_identity(observation))
+                if row is None:
+                    row = WorkoutMetric(
+                        activity_id=canonical_id,
+                        metric=observation["metric"],
+                        aggregation=observation["aggregation"],
+                        source=observation["source"],
+                        source_activity_id=observation["source_activity_id"],
+                    )
+                row.value = observation["value"]
+                row.unit = observation["unit"]
+                row.source_bucket = observation["source_bucket"]
+                row.source_ref = observation.get("source_ref") or source_ref
+                if observation.get("confidence") is not None:
+                    row.confidence = observation["confidence"]
+                elif confidence is not None:
+                    row.confidence = confidence
+                if observation.get("is_override"):
+                    row.is_override = True
+                row.updated_at = datetime.now(timezone.utc)
+                s.add(row)
+                stored.append(observation)
+            s.commit()
+
+        self.refresh_workout_metric_selection(canonical_id)
+        return {
+            "activity_id": canonical_id,
+            "requested_activity_id": activity_id,
+            "stored": len(stored),
+            "rejected": rejected,
+            "metrics": self.get_workout_metrics(canonical_id),
+        }
+
+    def canonical_activity_id(self, activity_id: int) -> int:
+        """The canonical workout an id belongs to (itself, unless merged)."""
+        with self.session() as s:
+            row = s.get(Workout, activity_id)
+            if row is not None and row.duplicate_of is not None:
+                return row.duplicate_of
+            link = s.exec(
+                select(WorkoutSourceLink).where(
+                    WorkoutSourceLink.source_activity_id == activity_id
+                )
+            ).first()
+            if link is not None:
+                return link.canonical_activity_id
+        return activity_id
+
+    def _metric_overrides(self, rows: list[WorkoutMetric]) -> dict[str, str]:
+        return {
+            _metric_key(row.metric, row.aggregation): row.source
+            for row in rows if row.is_override
+        }
+
+    def refresh_workout_metric_selection(self, activity_id: int) -> dict[str, Any]:
+        """Recompute which observation is canonical for each metric."""
+        with self.session() as s:
+            rows = s.exec(
+                select(WorkoutMetric).where(WorkoutMetric.activity_id == activity_id)
+            ).all()
+            if not rows:
+                return {}
+            observations = [
+                {
+                    "metric": r.metric, "aggregation": r.aggregation, "value": r.value,
+                    "unit": r.unit, "source": r.source,
+                    "source_bucket": r.source_bucket or source_bucket(r.source),
+                    "source_activity_id": r.source_activity_id,
+                    "confidence": r.confidence, "is_override": r.is_override,
+                    "_row": r,
+                }
+                for r in rows
+            ]
+            resolved = select_metrics(
+                observations, overrides=self._metric_overrides(rows)
+            )
+            winners = {
+                (
+                    entry["metric"], entry["aggregation"], entry["source"],
+                    entry.get("source_activity_id"),
+                ): entry["selection_reason"]
+                for entry in resolved.values()
+            }
+            for observation in observations:
+                row = observation.pop("_row")
+                identity = (
+                    row.metric, row.aggregation, row.source, row.source_activity_id,
+                )
+                row.is_selected = identity in winners
+                row.selection_reason = winners.get(identity)
+                row.updated_at = datetime.now(timezone.utc)
+                s.add(row)
+            s.commit()
+        return resolved
+
+    def get_workout_metrics(self, activity_id: int) -> dict[str, Any]:
+        """Selected metrics plus every observation behind them.
+
+        ``selected`` is the canonical value per metric with its provenance and
+        the alternatives that lost; ``observations`` is every stored reading.
+        Nothing here is reconstructed from notes.
+        """
+        canonical_id = self.canonical_activity_id(activity_id)
+        with self.session() as s:
+            rows = s.exec(
+                select(WorkoutMetric)
+                .where(WorkoutMetric.activity_id == canonical_id)
+                .order_by(WorkoutMetric.metric, WorkoutMetric.aggregation, WorkoutMetric.id)
+            ).all()
+        observations = [
+            {
+                "metric": r.metric, "aggregation": r.aggregation, "value": r.value,
+                "unit": r.unit, "source": r.source,
+                "source_bucket": r.source_bucket or source_bucket(r.source),
+                "source_activity_id": r.source_activity_id, "source_ref": r.source_ref,
+                "confidence": r.confidence, "is_override": r.is_override,
+                "is_selected": r.is_selected,
+            }
+            for r in rows
+        ]
+        resolved = select_metrics(
+            observations,
+            overrides={
+                _metric_key(r.metric, r.aggregation): r.source
+                for r in rows if r.is_override
+            },
+        )
+        return {
+            "activity_id": canonical_id,
+            "selected": resolved,
+            "observations": observations,
+            "observation_count": len(observations),
+            "conflicts": sorted(k for k, v in resolved.items() if v.get("conflict")),
+            "note": (
+                "every source's reading is kept; exactly one per metric is "
+                "selected, by the documented per-metric source rules or an "
+                "explicit override"
+            ),
+        }
+
+    def set_workout_metric_source(
+        self,
+        activity_id: int,
+        metric: str,
+        source: str,
+        aggregation: str | None = None,
+    ) -> dict[str, Any]:
+        """Pin one metric to one source — the user's override beats the rules."""
+        canonical_id = self.canonical_activity_id(activity_id)
+        name, agg = normalize_metric(metric, aggregation)
+        wanted = _normalize_metric_source(source)
+        with self.session() as s:
+            rows = s.exec(
+                select(WorkoutMetric)
+                .where(WorkoutMetric.activity_id == canonical_id)
+                .where(WorkoutMetric.metric == name)
+                .where(WorkoutMetric.aggregation == agg)
+            ).all()
+            if not rows:
+                return {
+                    "updated": False,
+                    "error": f"no {name}:{agg} observation recorded for {canonical_id}",
+                }
+            if not any(r.source == wanted for r in rows):
+                return {
+                    "updated": False,
+                    "error": f"no {name}:{agg} observation from source {wanted!r}",
+                    "available_sources": sorted({r.source for r in rows}),
+                }
+            for row in rows:
+                row.is_override = row.source == wanted
+                row.updated_at = datetime.now(timezone.utc)
+                s.add(row)
+            s.commit()
+        self.refresh_workout_metric_selection(canonical_id)
+        return {
+            "updated": True,
+            "activity_id": canonical_id,
+            "metric": name,
+            "aggregation": agg,
+            "source": wanted,
+            "metrics": self.get_workout_metrics(canonical_id),
+        }
+
+    def _repoint_workout_metrics(self, source_ids: list[int], canonical_id: int) -> None:
+        """Move observations from merged source rows onto their canonical.
+
+        The observation keeps its own ``source_activity_id``, so the raw
+        measurement stays attributable to the row it was recorded against even
+        though it now hangs off the canonical workout.
+        """
+        if not source_ids:
+            return
+        with self.session() as s:
+            rows = s.exec(
+                select(WorkoutMetric).where(
+                    WorkoutMetric.activity_id.in_([*source_ids, canonical_id])
+                )
+            ).all()
+            seen: dict[tuple, WorkoutMetric] = {}
+            for row in sorted(rows, key=lambda r: (r.activity_id != canonical_id, r.id or 0)):
+                identity = (row.metric, row.aggregation, row.source, row.source_activity_id)
+                if identity in seen and row.activity_id != canonical_id:
+                    # The same observation already sits on the canonical.
+                    s.delete(row)
+                    continue
+                row.activity_id = canonical_id
+                row.updated_at = datetime.now(timezone.utc)
+                seen[identity] = row
+                s.add(row)
+            s.commit()
+        self.refresh_workout_metric_selection(canonical_id)
+
+    def _restore_workout_metrics(self, canonical_id: int) -> None:
+        """Send observations back to the rows they were recorded against."""
+        with self.session() as s:
+            rows = s.exec(
+                select(WorkoutMetric).where(WorkoutMetric.activity_id == canonical_id)
+            ).all()
+            for row in rows:
+                if row.source_activity_id and row.source_activity_id != canonical_id:
+                    row.activity_id = row.source_activity_id
+                    row.is_selected = False
+                    row.selection_reason = None
+                    row.updated_at = datetime.now(timezone.utc)
+                    s.add(row)
+            s.commit()
 
     def backup_to(self, dest: str | Path) -> None:
         """Copy the live database to ``dest`` with SQLite's online backup API

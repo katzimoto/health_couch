@@ -25,25 +25,34 @@ from .strength_merge import _parse_start, is_strength_like
 # "manual_estimated"/"apple_estimated" in the brief just mean "that source's
 # estimated load" — every non-Garmin load already carries load_source, so the
 # row-source order below is enough and the winning row's load_source is kept.
+# ``equipment`` is a gym machine's own console (a bike, a rower, a treadmill).
+# It measures its own flywheel, so it owns what it physically counts — distance,
+# duration, and the calorie figure derived from its power — while the watch,
+# being strapped to the wearer, keeps heart rate and Garmin's training load.
+# Distance is therefore its *own* domain rather than riding along with
+# physiology: a machine-measured distance and a watch-measured heart rate
+# belong to the same canonical workout.
 _DOMAIN_PRIORITY: dict[str, tuple[str, ...]] = {
-    "duration": ("garmin", "apple", "manual"),
-    "physiology": ("garmin", "apple", "manual"),
-    "calories": ("garmin", "apple", "manual"),
-    "training_load": ("garmin", "manual", "apple"),
+    "duration": ("equipment", "garmin", "apple", "manual"),
+    "distance": ("equipment", "garmin", "apple", "manual"),
+    "physiology": ("garmin", "apple", "manual", "equipment"),
+    "calories": ("equipment", "garmin", "apple", "manual"),
+    "training_load": ("garmin", "manual", "apple", "equipment"),
 }
 
 # The physical Workout columns each domain owns.
 _DOMAIN_COLUMNS: dict[str, tuple[str, ...]] = {
     "duration": ("duration_s",),
-    "physiology": ("avg_hr", "max_hr", "start_time", "distance_m"),
+    "distance": ("distance_m",),
+    "physiology": ("avg_hr", "max_hr", "start_time"),
     "calories": ("calories",),
     "training_load": ("training_load",),
 }
 
 # name/type: manual wins for a strength session, Garmin for pure cardio —
 # unless the higher-priority source simply doesn't carry the field.
-_STRENGTH_NAME_PRIORITY = ("manual", "apple", "garmin")
-_CARDIO_NAME_PRIORITY = ("garmin", "apple", "manual")
+_STRENGTH_NAME_PRIORITY = ("manual", "apple", "garmin", "equipment")
+_CARDIO_NAME_PRIORITY = ("garmin", "apple", "manual", "equipment")
 
 # Matcher tolerances (tune here, not at call sites).
 MATCH_MAX_START_GAP_H = 3.0
@@ -62,7 +71,15 @@ def normalize_source(row: dict[str, Any]) -> str:
         return "garmin" if (row.get("activity_id") or 0) > 0 else "manual"
     if source == "garmin_merged":
         return "garmin"
-    return source
+    if source in ("garmin", "apple", "manual", "merged", "equipment"):
+        return source
+    # A specific machine's name ("star_trac") is useful provenance on the row;
+    # field priority only needs to know what *kind* of device it is. The metric
+    # module owns that mapping so there is one answer to the question.
+    from .workout_metrics import source_bucket
+
+    bucket = source_bucket(source)
+    return bucket if bucket in ("garmin", "apple", "equipment") else source
 
 
 def strength_match(

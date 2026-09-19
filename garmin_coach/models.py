@@ -134,6 +134,45 @@ class WorkoutSourceLink(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
+class WorkoutMetric(SQLModel, table=True):
+    """One measurement of one metric of one workout, by one source.
+
+    A workout recorded by two devices produces two rows for the same metric —
+    the watch's heart rate and the machine's power both belong to the session,
+    and when they measure the *same* thing (two calorie figures, say) both are
+    kept and exactly one is ``selected``. Nothing is overwritten, so a
+    disagreement stays inspectable with its provenance.
+
+    ``metric``/``aggregation`` are the identity (``power`` + ``avg``), ``unit``
+    is recorded as stated rather than silently converted, and
+    ``source``/``source_activity_id``/``source_ref`` say exactly where the
+    number came from. ``is_override`` marks a value the user chose explicitly,
+    which beats the automatic selection rules. Re-importing the same source's
+    reading of the same metric updates this row instead of adding another (see
+    ``workout_metrics.observation_identity``), so repeated syncs cannot
+    double-count a metric.
+    """
+
+    __tablename__ = "workout_metric"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    activity_id: int = Field(index=True)  # the canonical workout it belongs to
+    metric: str = Field(index=True)       # power | cadence | mets | heart_rate | ...
+    aggregation: str = "avg"              # avg | max | min | total
+    value: float
+    unit: Optional[str] = None
+    source: str = "manual"                # garmin | apple | star_trac | manual | ...
+    source_bucket: Optional[str] = None   # the kind of device (see workout_metrics)
+    source_activity_id: Optional[int] = None  # the row this observation came from
+    source_ref: Optional[str] = None      # free-form external reference
+    confidence: Optional[float] = None
+    is_selected: bool = False             # the canonical value for this metric
+    is_override: bool = False             # user picked this source explicitly
+    selection_reason: Optional[str] = None
+    meta_json: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
 class ActivityDetail(SQLModel, table=True):
     """Per-activity detail beyond the daily activity *summary* Garmin returns.
 

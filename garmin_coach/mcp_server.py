@@ -482,12 +482,28 @@ def log_workout(
     avg_hr: int | None = None,
     max_hr: int | None = None,
     training_load: float | None = None,
+    source: str | None = None,
+    start_time: str | None = None,
+    metrics: dict | list | None = None,
 ) -> dict:
-    """Log a workout not synced from Garmin (e.g. from Apple Health or a
-    manual description). ``day`` defaults to today. Assigned a synthetic
-    negative activity ID so it never collides with a real Garmin activity.
-    Pass ``training_load`` to override; otherwise it's estimated from
-    type/duration/HR so load analysis doesn't read the workout as rest."""
+    """Log a workout not synced from Garmin (e.g. from Apple Health, a gym
+    machine's console, or a manual description). ``day`` defaults to today.
+    Assigned a synthetic negative activity ID so it never collides with a real
+    Garmin activity. Pass ``training_load`` to override; otherwise it's
+    estimated from type/duration/HR so load analysis doesn't read the workout
+    as rest.
+
+    ``source`` records which device this reading came from — ``"manual"`` by
+    default, or a machine's name such as ``"star_trac"``, which is recognised
+    as gym equipment and therefore wins distance/duration/calories/power when
+    the session is merged with a watch recording.
+
+    ``metrics`` stores structured measurements alongside the summary fields,
+    either as a mapping (``{"avg_power": 82, "avg_cadence": 54, "avg_mets":
+    5.1}``) or as a list of ``{"metric", "value", "unit", "aggregation"}``
+    dicts. They are queryable through ``get_workout_metrics`` rather than
+    living in a note. ``start_time`` ("YYYY-MM-DD HH:MM:SS") helps the merge
+    matcher line this recording up with the watch's."""
     target_day = day or date.today().isoformat()
     activity_id = _synthetic_activity_id()
     load_source = "manual" if training_load is not None else None
@@ -505,16 +521,90 @@ def log_workout(
         avg_hr=avg_hr,
         max_hr=max_hr,
         training_load=training_load,
-        source="manual",
+        source=source or "manual",
+        start_time=start_time,
         load_source=load_source,
     )
-    return {
+    result = {
         "logged": True,
         "day": target_day,
         "activity_id": activity_id,
+        "source": source or "manual",
         "training_load": training_load,
         "load_source": load_source,
     }
+    if metrics:
+        result["metrics"] = db.upsert_workout_metrics(
+            activity_id, metrics, source=source or "manual"
+        )
+    return result
+
+
+@mcp.tool
+def upsert_workout_metrics(
+    activity_id: int,
+    metrics: dict | list,
+    source: str,
+    source_activity_id: int | None = None,
+    source_ref: str | None = None,
+    confidence: float | None = None,
+) -> dict:
+    """Attach structured measurements (power, cadence, METs, …) to a workout.
+
+    ``metrics`` is a mapping (``{"avg_power": 82, "max_cadence": 61}``) or a
+    list of ``{"metric", "value", "unit", "aggregation", "confidence"}`` dicts.
+    Names are normalised (``watts`` → power, ``rpm`` → cadence, an ``avg_``/
+    ``max_`` prefix becomes the aggregation) and unknown metric names are
+    accepted with the unit you state — the representation is extensible.
+
+    ``source`` names the device that measured them (``"garmin"``,
+    ``"star_trac"``, ``"apple"``, ``"manual"``, …). Every source's reading is
+    **kept**: when two devices report the same metric, both are stored and one
+    is selected by the documented per-metric rules (heart rate from the watch;
+    power/cadence/distance from the machine; training load from Garmin), with
+    the alternatives and any conflict reported. Re-sending the same source's
+    reading updates it in place, so repeated imports never double-count.
+
+    If the workout has already been merged into a canonical session, the
+    metrics attach to that canonical while each observation keeps the row it
+    was measured on."""
+    return db.upsert_workout_metrics(
+        activity_id,
+        metrics,
+        source=source,
+        source_activity_id=source_activity_id,
+        source_ref=source_ref,
+        confidence=confidence,
+    )
+
+
+@mcp.tool
+def get_workout_metrics(activity_id: int) -> dict:
+    """Structured metrics for a workout: the selected value per metric with its
+    unit, aggregation, source and the reason it was chosen — plus every other
+    observation that was kept, and which metrics the sources disagree on.
+
+    Pass any source activity id; the canonical session's metrics come back."""
+    return db.get_workout_metrics(activity_id)
+
+
+@mcp.tool
+def set_workout_metric_source(
+    activity_id: int,
+    metric: str,
+    source: str,
+    aggregation: str | None = None,
+) -> dict:
+    """Override which source supplies one metric of a workout.
+
+    Use when you know which device was actually accurate — e.g. pin
+    ``heart_rate`` to the chest strap rather than the machine's grips. The
+    override beats the automatic rules and persists; every other observation is
+    still kept and can be re-selected later. ``aggregation`` defaults to the
+    one implied by the metric name (``avg`` unless the name says otherwise)."""
+    return db.set_workout_metric_source(
+        activity_id, metric, source, aggregation=aggregation
+    )
 
 
 @mcp.tool
