@@ -49,6 +49,8 @@ from .progression import recommend_next_weight, recovery_caution
 from .reminders import DEFAULT_TIMEZONE, Reminders
 from .swimming import build_swimming_progress
 from .strength_progress import build_strength_progress
+from .sport_load import build_sport_training_load
+from .progress_report import build_training_progress_report
 from .telegram_sender import send_telegram_message
 from .training_load import estimate_training_load
 from .workout_flow import WorkoutLogFlows
@@ -111,22 +113,100 @@ def get_sleep_trend(days: int = 30) -> dict:
 
 
 @mcp.tool
-def get_training_load(days: int = 28) -> dict:
+def get_training_load(days: int = 28, by_sport: bool = False) -> dict:
     """EWMA-weighted acute (7d) vs chronic (28d) training load, their ratio,
     and recent workouts (duplicates excluded). Ratio >1.5 = spike, <0.8 =
     detraining. Each workout's ``load_source`` says whether its load is
     garmin-provided, estimated (documented heuristic), or manually entered.
     A merged workout (manual strength + Garmin activity) counts once, with the
     Garmin load when available; ``merged_workouts`` lists these with their
-    field provenance."""
-    return {
+    field provenance.
+
+    Pass ``by_sport=True`` to add a per-sport decomposition of the *same* load
+    metric (see ``get_sport_training_load``) under ``sport_breakdown``; the
+    existing keys are unchanged either way."""
+    result = {
         "acute_chronic": analyzer.acute_chronic_ratio(),
         "recent_workouts": db.recent_workouts(days=days),
         "merged_workouts": db.merged_workout_summaries(days=days),
     }
+    if by_sport:
+        result["sport_breakdown"] = build_sport_training_load(db, days=days)
+    return result
+
+
+@mcp.tool
+def get_sport_training_load(days: int = 28, sport: str | None = None) -> dict:
+    """Training load broken down by sport, over the same metric as
+    ``get_training_load``.
+
+    ``by_sport`` gives, per activity type: session count and sessions/week,
+    duration and (where meaningful) distance, total and weekly load, the load's
+    provenance split (``load_by_source``: device EPOC value vs the documented
+    estimate vs manual — reported separately because they are not the same
+    measurement), a per-sport acute:chronic pair computed with the same EWMA
+    spans as the overall metric, and per-sport coverage.
+
+    A sport whose own history is too short, or whose chronic load is zero,
+    returns an unavailable ratio **with a reason** rather than a divide by zero.
+    ``reconciliation`` proves the sport buckets sum to the reported total;
+    strength's supplemental workload (session frequency, completed working sets,
+    kg × reps volume) is a separate, deliberately non-additive block that stays
+    visible even when the device recorded no heart rate or load.
+
+    ``rest_and_coverage`` distinguishes confirmed rest (a day that synced with
+    no session) from unknown days (no recorded sync at all), and
+    ``data_quality`` lists recordings excluded as incomplete or inconsistent.
+
+    Acute:chronic figures here are descriptive monitoring signals over your own
+    history — not injury predictions, and not universal safe/unsafe thresholds.
+
+    Pass ``sport`` (e.g. "lap_swimming", "running", "strength_training") to
+    narrow to one activity type."""
+    return build_sport_training_load(db, days=max(1, min(days, 730)), sport=sport)
 
 
 # ── Progression analytics ───────────────────────────────────────────────────────
+
+@mcp.tool
+def get_training_progress_report(
+    days: int = 56,
+    baseline_days: int | None = None,
+    detail: bool = False,
+) -> dict:
+    """THE "how am I progressing?" call: one baseline-relative report covering
+    every recorded sport plus strength, adherence and recovery.
+
+    Composed from the deterministic analytics services (activity, swimming,
+    strength, training load, data quality) — not from an LLM re-deriving numbers
+    from raw logs — so its totals match the individual endpoints for the same
+    window.
+
+    Returns the explicit analysis and comparison windows with the baseline's
+    selection method, sync coverage, and sections for ``sports`` (every activity
+    type recorded in the window, so swimming or another major sport can never be
+    silently omitted), ``swimming`` (active vs elapsed pace, rest, efficiency,
+    continuous bests), ``strength`` (per-exercise records and progression with
+    load conventions preserved), ``adherence`` (TrainingPlan statuses with an
+    explicit denominator — no recorded plan means unknown, never zero),
+    ``recovery`` (reused from the existing analyzer, as context and not as a
+    cause), ``notable_prs`` (each labelled observation or estimate, with source
+    ids), ``concerns`` (declines, effort-confounded improvements, thin samples,
+    incomplete recordings, unresolved reconciliation, sparse coverage) and
+    ``data_quality``.
+
+    Comparisons are against the user's own preceding window of equal length — no
+    population rankings and no forecasts — and no blended "overall fitness +X%"
+    number is produced. ``detail=True`` adds full per-sport progression, the
+    per-exercise strength history and the sport load breakdown for drill-down;
+    the default is the bounded summary."""
+    return build_training_progress_report(
+        db,
+        days=max(1, min(days, 730)),
+        baseline_days=baseline_days,
+        detail=detail,
+    )
+
 
 @mcp.tool
 def get_activity_progress(
@@ -343,6 +423,7 @@ def get_today_coaching_context(
     day: str | None = None,
     refresh_if_stale: bool = True,
     include_recommendation: bool = True,
+    include_progress_summary: bool = False,
 ) -> dict:
     """THE daily-coaching call: everything needed to answer "based on all my
     current data, what should I do today?" in one structured payload.
@@ -360,13 +441,19 @@ def get_today_coaching_context(
     With ``refresh_if_stale`` (default true) a stale Garmin sync (>90 min) is
     refreshed first; if Garmin is unreachable the latest cached data is used and
     the failure is reported under data_freshness.refresh rather than returning a
-    generic "connector unavailable"."""
+    generic "connector unavailable".
+
+    ``include_progress_summary`` attaches a bounded summary of
+    ``get_training_progress_report`` under ``progress_summary`` — the same
+    deterministic numbers, so the coach cites the progress report rather than
+    re-deriving trends from raw rows."""
     return build_coaching_context(
         db,
         day=day,
         refresh_if_stale=refresh_if_stale,
         include_recommendation=include_recommendation,
         garmin_sync=_refresh_today_from_garmin if refresh_if_stale else None,
+        include_progress_summary=include_progress_summary,
     )
 
 

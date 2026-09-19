@@ -363,6 +363,132 @@ never force-merges and never writes; a test asserts storage is byte-identical
 before and after. Applying a fix is a separate, explicit call with `dry_run`
 available to preview it.
 
+## `get_sport_training_load(days=28, sport=None)` / `get_training_load(days, by_sport=True)`
+
+Per-sport decomposition of the training-load metric — `garmin_coach/sport_load.py`.
+
+`get_training_load(days)` is unchanged: same keys, same acute:chronic numbers.
+`by_sport=True` adds a `sport_breakdown` block; the dedicated tool returns that
+block alone.
+
+### It is a decomposition, not a second metric
+
+Per-sport load is the same `Workout.training_load` column, bucketed with the
+same normalizer `get_activity_progress` uses. So:
+
+* `reconciliation.sum_of_sport_load == reconciliation.reported_total_load`
+  (asserted by a test, and reported as `reconciles` in every unfiltered call);
+* the per-sport acute:chronic pair uses the **same** EWMA spans (7 d / 28 d) and
+  the same seeding rule as `Analyzer.acute_chronic_ratio`, so a single-sport
+  history produces the same ratio in both views;
+* anything not on that scale — strength working sets, kg × reps volume — lives
+  in a separate `strength_workload` block listed under
+  `reconciliation.not_summed` and is never added in.
+
+### Per sport
+
+| Field | Notes |
+| --- | --- |
+| `session_count`, `sessions_per_week` | Canonical workouts only; merged sessions count once. |
+| `total_duration_s`, `weekly_duration_s` | Always available. |
+| `total_distance_m`, `weekly_distance_m` | `null` + `distance_unavailable_reason` where distance isn't meaningful. |
+| `total_training_load`, `weekly_training_load` | The bucketed legacy metric. |
+| `load_by_source` | `garmin` (device EPOC) vs `estimated` (documented heuristic) vs `manual`, with session counts and `sessions_without_load`. Different methods, reported separately. |
+| `acute_chronic` | Per-sport EWMA pair + ratio, or `unavailable_reason`. |
+| `coverage` | Sessions with a load value vs total — a session without one is **missing data, not zero load**. |
+| `excluded_activity_ids` | Recordings the quality detector flagged as unusable. |
+
+A sport whose own history spans fewer than `SPORT_MIN_HISTORY_DAYS` (21) days,
+or whose chronic load is zero, returns `ratio: null` with the reason — never a
+divide by zero and never a number borrowed from the overall series.
+
+### Strength
+
+`strength_workload` reports session frequency, `completed_working_sets`,
+`exercises_performed`, `completed_volume_kg` (exact per-set where the data
+supports it, `volume_basis` says which) and `weekly_volume_kg`, with units
+spelled out. It is computed from the logged sets, so **strength workload stays
+visible when the device recorded no HR and no load at all**.
+
+### Rest vs missing sync
+
+`rest_and_coverage` separates:
+
+* `active_days` — a session was recorded;
+* `confirmed_rest_days` — the day synced successfully and had no session;
+* `unknown_days` — no recorded sync at all, so nothing can be concluded.
+
+### Limitations
+
+* Acute:chronic is a descriptive monitoring signal over the user's own history —
+  **not** an injury prediction and not a universal safe/unsafe threshold. Every
+  ratio carries that note.
+* Optional session-RPE × duration is deliberately *not* synthesised: the repo's
+  estimator already documents its inputs, and inventing an RPE or deriving a
+  full-session load from a truncated recording is exactly what the quality
+  detector exists to prevent.
+
+## `get_training_progress_report(days=56, baseline_days=None, detail=False)`
+
+The default answer source for *"how am I progressing?"* —
+`garmin_coach/progress_report.py`. Composed from the deterministic services
+above, not from an LLM re-deriving numbers from raw logs.
+
+### Sections
+
+| Section | Contents |
+| --- | --- |
+| `sports` | One section per activity type **actually recorded** in the window (so swimming or another major sport can never be silently omitted), each with summary, baseline summary, comparison and observed records. |
+| `swimming` | The full swimming report when any swim exists, else `available: false` with a reason. |
+| `strength` | Per-exercise records, progression and load conventions. |
+| `adherence` | `TrainingPlan` statuses with an explicit denominator. |
+| `recovery` | Reused from `Analyzer.report` plus the latest readiness check-in. |
+| `notable_prs` | Each labelled `observation` or `estimate`, with `basis` and source ids. |
+| `concerns` | Declines, effort-confounded improvements, thin samples, incomplete recordings, unresolved reconciliation, sparse coverage. |
+| `data_quality` | The quality roll-up plus the ids excluded from totals and records. |
+
+### Consistency by construction
+
+The `sports` sections are built from one `recent_workouts` scan through the
+**same** `activity_progress` primitives (`summarize_sessions`, `compare`,
+`observed_records`) that `get_activity_progress` uses. A test asserts the
+report's running section equals the per-sport endpoint's numbers — count,
+distance, pace and records — for the same window. `detail=True` adds the full
+per-sport reports, the per-exercise strength history and the sport load
+breakdown.
+
+### Adherence
+
+```
+completion_rate_pct = (completed + 0.5 × partially_completed) ÷ resolved × 100
+```
+
+`resolved` = done + partially_done + skipped. Plans still marked `planned` are
+excluded from the rate and reported as `still_open`. **No recorded plan means
+adherence is `available: false` with a reason — never 0%.**
+
+### What it will not say
+
+* No population rankings and no forecasts — the comparison is the user's own
+  preceding window of equal length, with its selection method stated.
+* No blended *"overall fitness +X%"*: unrelated lifts and sports are never
+  collapsed into one number.
+* Recovery is context, not a cause: the report never claims a recovery metric
+  explains a performance change.
+* A faster pace at a higher heart rate is reported as an observation **and**
+  raised as a concern (`effort_confounded_improvement`), not as proof of
+  improved fitness.
+
+### Reuse in coaching
+
+`progress_report_summary()` is the bounded form. `build_coaching_context(...,
+include_progress_summary=True)` — and `get_today_coaching_context(
+include_progress_summary=True)` — attach it under `progress_summary`, so the
+coach cites these deterministic numbers instead of re-deriving trends. It is off
+by default so the 07:30 plan job stays cheap, and it is failure-isolated: a
+problem building it records an error in that key rather than costing the daily
+plan its context.
+
 ## Structured workout metrics (`get_workout_metrics`, `upsert_workout_metrics`, `set_workout_metric_source`)
 
 Multi-source measurements — `garmin_coach/workout_metrics.py` plus the
@@ -433,3 +559,4 @@ row it was measured on. Re-importing a source's reading of a metric updates that
 row (`observation_identity` is the key), a repeated merge does not duplicate
 observations, and `unmerge_workout_sources` returns them to their source rows.
 The workout itself still counts once in summaries and training load.
+
