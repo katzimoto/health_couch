@@ -370,6 +370,8 @@ def build_coaching_context(
     include_recommendation: bool = True,
     garmin_sync: Callable[[], Any] | None = None,
     timezone_name: str | None = None,
+    include_progress_summary: bool = False,
+    progress_summary_days: int = 56,
 ) -> dict[str, Any]:
     """Assemble the full daily coaching context for ``day`` (default today).
 
@@ -382,6 +384,12 @@ def build_coaching_context(
     ``data_freshness.sources`` reports, per source, whether data was available —
     so a caller can see what was retrieved and what was missing instead of a
     blanket "connector unavailable".
+
+    ``include_progress_summary`` attaches the bounded summary of the unified
+    progress report (see :mod:`~garmin_coach.progress_report`) under
+    ``progress_summary``, so the coaching prompt reuses those deterministic
+    numbers rather than re-deriving progress from raw rows. Off by default: the
+    07:30 plan job stays cheap unless it asks for it.
     """
     from .config import settings
 
@@ -536,6 +544,25 @@ def build_coaching_context(
         "flags": report.get("flags", []) if isinstance(report, dict) else [],
         "data_quality_warnings": data_quality_warnings,
     }
+
+    if include_progress_summary:
+        # A bounded, already-computed summary of the progress report — the
+        # coach cites these deterministic numbers instead of re-deriving
+        # trends from raw rows. Isolated: a failure here must never cost the
+        # daily plan its context.
+        try:
+            from .progress_report import (
+                build_training_progress_report,
+                progress_report_summary,
+            )
+
+            context["progress_summary"] = progress_report_summary(
+                build_training_progress_report(db, days=progress_summary_days)
+            )
+        except Exception as exc:  # noqa: BLE001 — context assembly must not break
+            context["progress_summary"] = {
+                "available": False, "error": str(exc),
+            }
 
     if include_recommendation:
         context["recommendation"] = build_recommendation(
